@@ -1,0 +1,85 @@
+name: build-image-fork
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/nack-jetstream-controller
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile jetstream-controller (linux/amd64)
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -tags timetzdata \
+            -ldflags "-s -w \
+              -X main.Version=${{ github.ref_name }}-${GITHUB_SHA::7} \
+              -X main.GitInfo=${{ github.ref_name }}-${GITHUB_SHA::7} \
+              -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
+            -o bin/jetstream-controller-amd64 \
+            ./cmd/jetstream-controller
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Stage binary in build context
+        run: cp bin/jetstream-controller-amd64 ./jetstream-controller-amd64
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cicd/Dockerfile.copy
+          platforms: linux/amd64
+          build-args: |
+            BIN=jetstream-controller-amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Print pull command
+        run: |
+          echo "Image pushed. Pull with one of:"
+          echo "${{ steps.meta.outputs.tags }}"
