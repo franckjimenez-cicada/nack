@@ -12,7 +12,7 @@
 # Provide --build-arg VERSION=<...> to stamp main.Version at build time.
 
 ARG GO_VERSION=1.25
-ARG ALPINE_VERSION=3.23.3
+ARG ALPINE_VERSION=3.23
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS build
 
