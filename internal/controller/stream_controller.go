@@ -182,6 +182,12 @@ func (r *StreamReconciler) deleteStream(ctx context.Context, log logr.Logger, st
 }
 
 func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, stream *api.Stream) error {
+	// gated tracks whether the BackupRequired condition was raised
+	// during this reconcile pass. The outer block uses it to decide
+	// whether to short-circuit the success-path Ready=True update.
+	var gated bool
+	var gatedReason, gatedMessage string
+
 	// CreateOrUpdateStream is called on every reconciliation when the stream is not to be deleted.
 	err := r.WithJSMClient(stream.Spec.ConnectionOpts, stream.Namespace, func(js *jsm.Manager) error {
 		storedState, err := getStoredStreamState(stream)
@@ -208,7 +214,26 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// to the server, the only correct path is to delete the server stream
 		// and re-create from the CR. This is opt-in to preserve upstream
 		// semantics.
+		//
+		// When --require-backup-confirmation is set we additionally gate
+		// the destructive delete on either (a) the cross-region peer
+		// already holding this stream's data, or (b) an external operator
+		// confirming a backup via the configured annotation. See
+		// streamBackupGate below for the full predicate.
 		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, &stream.Spec) {
+			gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
+			if gateErr != nil {
+				return fmt.Errorf("evaluate backup gate: %w", gateErr)
+			}
+			if gateFires {
+				log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
+					"reason", reason, "message", msg,
+				)
+				gated = true
+				gatedReason = reason
+				gatedMessage = msg
+				return nil
+			}
 			log.Info("Source<->mirror flip detected; force-recreating Stream.",
 				"specHasMirror", stream.Spec.Mirror != nil,
 				"serverHasMirror", serverState.Mirror != nil,
@@ -261,6 +286,19 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				// change requires source<->mirror flip, force-delete and
 				// re-create. Bounded to a single retry.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
+					if gateErr != nil {
+						return fmt.Errorf("evaluate backup gate: %w", gateErr)
+					}
+					if gateFires {
+						log.Info("Reactive recreate gated by --require-backup-confirmation; awaiting external backup.",
+							"reason", reason, "message", msg, "natsErr", err.Error(),
+						)
+						gated = true
+						gatedReason = reason
+						gatedMessage = msg
+						return nil
+					}
 					log.Info("UpdateConfiguration rejected by NATS as mirror-incompatible; force-recreating Stream.",
 						"err", err.Error(),
 					)
@@ -314,6 +352,28 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		}
 		return err
 	}
+
+	if gated {
+		// The destructive recreate path was blocked by the backup gate.
+		// Surface that via the BackupRequired condition + a non-Ready
+		// status. Do NOT bump observedGeneration — the next reconcile
+		// should re-evaluate against the latest spec/state.
+		stream.Status.Conditions = updateBackupRequiredCondition(
+			stream.Status.Conditions, v1.ConditionTrue, gatedReason, gatedMessage,
+		)
+		stream.Status.Conditions = updateReadyCondition(
+			stream.Status.Conditions, v1.ConditionFalse, stateWaitingForBackup, gatedMessage,
+		)
+		if err := r.Status().Update(ctx, stream); err != nil {
+			return fmt.Errorf("update BackupRequired condition: %w", err)
+		}
+		return nil
+	}
+
+	// Clear any stale BackupRequired condition that may have been
+	// raised on a prior reconcile — the destructive recreate either
+	// completed or was never needed this pass.
+	stream.Status.Conditions = removeBackupRequiredCondition(stream.Status.Conditions)
 
 	// update the observed generation and ready status
 	stream.Status.ObservedGeneration = stream.Generation
@@ -729,6 +789,73 @@ func streamMirrorFlipped(serverState *jsmapi.StreamConfig, spec *api.StreamSpec)
 	serverHasMirror := serverState.Mirror != nil
 	specHasMirror := spec.Mirror != nil
 	return serverHasMirror != specHasMirror
+}
+
+// streamBackupGate evaluates whether the destructive recreate should be
+// held off pending external backup confirmation. Returns:
+//
+//	gateFires == true  → caller must NOT destroy. Sets BackupRequired
+//	                     condition with the returned reason+message.
+//	gateFires == false → caller may proceed with delete + recreate.
+//
+// The gate ONLY fires when r.RequireBackupConfirmation() is true AND the
+// local server stream has messages AND the cross-region peer can't
+// confirm the data is replicated AND no fresh backup-confirmed
+// annotation matches the CR's current generation. Any other state lets
+// the caller proceed (preserves existing behavior).
+//
+// `gateErr` is returned only when the local state lookup itself errors
+// out — caller should treat that as a hard reconcile failure.
+func (r *StreamReconciler) streamBackupGate(jsm *jsm.Manager, stream *api.Stream, serverConfig *jsmapi.StreamConfig) (gateFires bool, reason, message string, gateErr error) {
+	if !r.RequireBackupConfirmation() {
+		return false, "", "", nil
+	}
+	// Inspect the live server state to learn the message count. The
+	// config alone doesn't carry it.
+	streamName := stream.Spec.Name
+	s, err := jsm.LoadStream(streamName)
+	if err != nil {
+		if jsmapi.IsNatsErr(err, JSStreamNotFoundErr) {
+			// No server stream yet — nothing to back up.
+			return false, "", "", nil
+		}
+		return false, "", "", fmt.Errorf("load stream for state: %w", err)
+	}
+	state, err := s.LatestState()
+	if err != nil {
+		return false, "", "", fmt.Errorf("read stream state: %w", err)
+	}
+	if state.Msgs == 0 {
+		// No local data to lose — safe to recreate.
+		return false, "", "", nil
+	}
+	// Annotation gate: if drp-operator (or any external) signalled
+	// that the backup is complete for THIS generation, proceed.
+	if backupConfirmedForGeneration(stream.Annotations, r.BackupConfirmedAnnotation(), stream.Generation) {
+		return false, "", "", nil
+	}
+	// Cross-region probe: when configured, fetch the peer's message
+	// count for the same stream name and let it through if the peer
+	// has at least as many messages locally.
+	if url := r.CrossRegionNATSURL(); url != "" {
+		peerMsgs, exists, probeErr := probeCrossRegionStreamMsgs(url, r.CrossRegionNATSCredsPath(), streamName, 5*time.Second)
+		if probeErr == nil && exists && peerMsgs >= state.Msgs {
+			return false, "", "", nil
+		}
+		switch {
+		case probeErr != nil:
+			return true, "PeerUnreachable",
+				fmt.Sprintf("local has %d messages; cross-region probe failed: %v", state.Msgs, probeErr), nil
+		case !exists:
+			return true, "PeerMissing",
+				fmt.Sprintf("local has %d messages; cross-region peer stream %q not found", state.Msgs, streamName), nil
+		default:
+			return true, "PeerStale",
+				fmt.Sprintf("local has %d messages; cross-region peer has %d", state.Msgs, peerMsgs), nil
+		}
+	}
+	return true, "NoProbeConfigured",
+		fmt.Sprintf("local has %d messages and --cross-region-nats-url is unset", state.Msgs), nil
 }
 
 // isMirrorIncompatibleErr returns true for NATS API errors emitted when an

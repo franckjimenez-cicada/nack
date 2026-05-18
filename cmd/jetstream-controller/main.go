@@ -83,6 +83,10 @@ func run() error {
 	controlLoopSyncInterval := flag.Duration("sync-interval", time.Minute, "Interval to perform scheduled reconcile")
 	healthProbeBindAddress := flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to")
 	mirrorRecreateOnConflict := flag.Bool("mirror-recreate-on-conflict", false, "Force-delete and re-create a Stream / KeyValue underlying NATS stream when the K8s spec flips between source-mode and mirror-mode, or when UpdateConfiguration returns a mirror-incompatible NATS error (10031 / 10034 / 10055). Off by default to preserve upstream semantics; opt in for DRP-style failover workflows where the only correct recovery is a clean recreate.")
+	requireBackupConfirmation := flag.Bool("require-backup-confirmation", false, "Gate the destructive recreate triggered by --mirror-recreate-on-conflict on an external backup operator confirming local data via the annotation set by --backup-confirmed-annotation. When set and the local stream has data AND the cross-region peer is unreachable or holds fewer messages, the controller sets a BackupRequired=True condition and waits instead of destroying. Pairs with --cross-region-nats-url for the readiness probe.")
+	crossRegionNATSURL := flag.String("cross-region-nats-url", "", "NATS URL used by --require-backup-confirmation to probe whether the peer region already holds this stream's data. Empty disables the probe — every destructive recreate against a stream with local data will demand external backup confirmation.")
+	crossRegionNATSCredsPath := flag.String("cross-region-nats-creds-path", "", "Local filesystem path inside the controller container to the NATS credentials file used for the cross-region probe. Typically mounted from a K8s Secret. Empty disables auth.")
+	backupConfirmedAnnotation := flag.String("backup-confirmed-annotation", "drp.cicada.io/backup-confirmed-generation", "Annotation key the controller reads to know an external backup operator has captured the CR's local state. Value must equal the CR's metadata.generation as a decimal string.")
 
 	flag.Parse()
 
@@ -119,12 +123,16 @@ func run() error {
 		}
 
 		controllerCfg := &controller.Config{
-			ReadOnly:                 *readOnly,
-			Namespace:                *namespace,
-			CacheDir:                 *cacheDir,
-			RequeueInterval:          *controlLoopSyncInterval,
-			HealthProbeBindAddress:   *healthProbeBindAddress,
-			MirrorRecreateOnConflict: *mirrorRecreateOnConflict,
+			ReadOnly:                  *readOnly,
+			Namespace:                 *namespace,
+			CacheDir:                  *cacheDir,
+			RequeueInterval:           *controlLoopSyncInterval,
+			HealthProbeBindAddress:    *healthProbeBindAddress,
+			MirrorRecreateOnConflict:  *mirrorRecreateOnConflict,
+			RequireBackupConfirmation: *requireBackupConfirmation,
+			CrossRegionNATSURL:        *crossRegionNATSURL,
+			CrossRegionNATSCredsPath:  *crossRegionNATSCredsPath,
+			BackupConfirmedAnnotation: *backupConfirmedAnnotation,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)

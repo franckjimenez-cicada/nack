@@ -190,6 +190,12 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		return fmt.Errorf("map spec to keyvalue targetConfig: %w", err)
 	}
 
+	// gated mirrors the Stream reconciler — see stream_controller.go
+	// for the BackupRequired gate semantics. The KV's underlying NATS
+	// stream is "KV_<bucket>"; the probe + msg-count check use that.
+	var gated bool
+	var gatedReason, gatedMessage string
+
 	// UpdateKeyValue is called on every reconciliation when the stream is not to be deleted.
 	err = r.WithJetStreamClient(keyValue.Spec.ConnectionOpts, keyValue.Namespace, func(js jetstream.JetStream) error {
 		storedState, err := getStoredKeyValueState(keyValue)
@@ -205,6 +211,19 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		// Proactive source<->mirror flip handling. See the matching block in
 		// stream_controller.go for the rationale.
 		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, &keyValue.Spec) {
+			gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
+			if gateErr != nil {
+				return fmt.Errorf("evaluate backup gate: %w", gateErr)
+			}
+			if gateFires {
+				log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
+					"reason", reason, "message", msg,
+				)
+				gated = true
+				gatedReason = reason
+				gatedMessage = msg
+				return nil
+			}
 			log.Info("Source<->mirror flip detected; force-recreating KeyValue.",
 				"specHasMirror", keyValue.Spec.Mirror != nil,
 				"serverHasMirror", serverState.Mirror != nil,
@@ -251,6 +270,19 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				// Reactive fallback: recreate the underlying KV stream when
 				// NATS rejects the update as mirror-incompatible.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
+					if gateErr != nil {
+						return fmt.Errorf("evaluate backup gate: %w", gateErr)
+					}
+					if gateFires {
+						log.Info("Reactive recreate gated by --require-backup-confirmation; awaiting external backup.",
+							"reason", reason, "message", msg, "natsErr", err.Error(),
+						)
+						gated = true
+						gatedReason = reason
+						gatedMessage = msg
+						return nil
+					}
 					log.Info("UpdateKeyValue rejected by NATS as mirror-incompatible; force-recreating KeyValue.",
 						"err", err.Error(),
 					)
@@ -309,6 +341,21 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		}
 		return err
 	}
+
+	if gated {
+		keyValue.Status.Conditions = updateBackupRequiredCondition(
+			keyValue.Status.Conditions, v1.ConditionTrue, gatedReason, gatedMessage,
+		)
+		keyValue.Status.Conditions = updateReadyCondition(
+			keyValue.Status.Conditions, v1.ConditionFalse, stateWaitingForBackup, gatedMessage,
+		)
+		if err := r.Status().Update(ctx, keyValue); err != nil {
+			return fmt.Errorf("update BackupRequired condition: %w", err)
+		}
+		return nil
+	}
+
+	keyValue.Status.Conditions = removeBackupRequiredCondition(keyValue.Status.Conditions)
 
 	// update the observed generation and ready status
 	keyValue.Status.ObservedGeneration = keyValue.Generation
@@ -433,6 +480,54 @@ func (r *KeyValueReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(r)
+}
+
+// keyValueBackupGate mirrors streamBackupGate for KV. The underlying
+// NATS stream is "KV_<bucket>" and that's what the cross-region probe
+// queries; from the operator's perspective the safety story is
+// identical to a regular Stream.
+func (r *KeyValueReconciler) keyValueBackupGate(ctx context.Context, js jetstream.JetStream, keyValue *api.KeyValue) (gateFires bool, reason, message string, gateErr error) {
+	if !r.RequireBackupConfirmation() {
+		return false, "", "", nil
+	}
+	bucket := keyValue.Spec.Bucket
+	streamName := kvStreamPrefix + bucket
+	s, err := js.Stream(ctx, streamName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return false, "", "", nil
+		}
+		return false, "", "", fmt.Errorf("load KV stream for state: %w", err)
+	}
+	info, err := s.Info(ctx)
+	if err != nil {
+		return false, "", "", fmt.Errorf("read KV stream info: %w", err)
+	}
+	if info.State.Msgs == 0 {
+		return false, "", "", nil
+	}
+	if backupConfirmedForGeneration(keyValue.Annotations, r.BackupConfirmedAnnotation(), keyValue.Generation) {
+		return false, "", "", nil
+	}
+	if url := r.CrossRegionNATSURL(); url != "" {
+		peerMsgs, exists, probeErr := probeCrossRegionStreamMsgs(url, r.CrossRegionNATSCredsPath(), streamName, 5*time.Second)
+		if probeErr == nil && exists && peerMsgs >= info.State.Msgs {
+			return false, "", "", nil
+		}
+		switch {
+		case probeErr != nil:
+			return true, "PeerUnreachable",
+				fmt.Sprintf("local KV %q has %d messages; cross-region probe failed: %v", bucket, info.State.Msgs, probeErr), nil
+		case !exists:
+			return true, "PeerMissing",
+				fmt.Sprintf("local KV %q has %d messages; cross-region peer stream %q not found", bucket, info.State.Msgs, streamName), nil
+		default:
+			return true, "PeerStale",
+				fmt.Sprintf("local KV %q has %d messages; cross-region peer has %d", bucket, info.State.Msgs, peerMsgs), nil
+		}
+	}
+	return true, "NoProbeConfigured",
+		fmt.Sprintf("local KV %q has %d messages and --cross-region-nats-url is unset", bucket, info.State.Msgs), nil
 }
 
 // keyValueMirrorFlipped reports whether the desired KeyValue spec disagrees

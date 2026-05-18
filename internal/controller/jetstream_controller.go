@@ -18,6 +18,7 @@ import (
 	"github.com/nats-io/jsm.go"
 	js "github.com/nats-io/nack/controllers/jetstream"
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -67,6 +68,27 @@ type JetStreamController interface {
 	// K8s CR when a source<->mirror flip is detected, instead of letting
 	// UpdateConfiguration silently retry forever.
 	MirrorRecreateOnConflict() bool
+
+	// RequireBackupConfirmation returns true when destructive recreate
+	// should be gated on an external backup operator confirming the
+	// local data via the BackupConfirmedAnnotation matching the CR's
+	// current generation. See Config.RequireBackupConfirmation for the
+	// full semantics.
+	RequireBackupConfirmation() bool
+
+	// CrossRegionNATSURL is the NATS URL the controller uses for the
+	// pre-destruction "does the peer have this data?" probe. Empty
+	// means the probe is skipped.
+	CrossRegionNATSURL() string
+
+	// CrossRegionNATSCredsPath is the local file path to the creds
+	// used for the cross-region probe. Empty allowed.
+	CrossRegionNATSCredsPath() string
+
+	// BackupConfirmedAnnotation is the annotation key the controller
+	// reads to know the external backup completed. Value must match
+	// the CR's current generation (decimal) for the gate to clear.
+	BackupConfirmedAnnotation() string
 }
 
 func NewJSController(k8sClient client.Client, natsConfig *NatsConfig, controllerConfig *Config) (JetStreamController, error) {
@@ -106,6 +128,25 @@ func (c *jsController) ReadOnly() bool {
 
 func (c *jsController) MirrorRecreateOnConflict() bool {
 	return c.controllerConfig.MirrorRecreateOnConflict
+}
+
+func (c *jsController) RequireBackupConfirmation() bool {
+	return c.controllerConfig.RequireBackupConfirmation
+}
+
+func (c *jsController) CrossRegionNATSURL() string {
+	return c.controllerConfig.CrossRegionNATSURL
+}
+
+func (c *jsController) CrossRegionNATSCredsPath() string {
+	return c.controllerConfig.CrossRegionNATSCredsPath
+}
+
+func (c *jsController) BackupConfirmedAnnotation() string {
+	if c.controllerConfig.BackupConfirmedAnnotation == "" {
+		return defaultBackupConfirmedAnnotation
+	}
+	return c.controllerConfig.BackupConfirmedAnnotation
 }
 
 func (c *jsController) ValidNamespace(namespace string) bool {
@@ -481,6 +522,100 @@ func updateReadyCondition(conditions []api.Condition, status v1.ConditionStatus,
 // Helper for mapping spec config to jetStream config using UnmarshalJSON.
 func jsonString(v string) []byte {
 	return []byte("\"" + v + "\"")
+}
+
+// updateBackupRequiredCondition upserts the BackupRequired condition.
+// Pass v1.ConditionFalse + empty reason/message to clear the gate.
+func updateBackupRequiredCondition(conditions []api.Condition, status v1.ConditionStatus, reason string, message string) []api.Condition {
+	var currentStatus v1.ConditionStatus
+	var lastTransitionTime string
+	for _, condition := range conditions {
+		if condition.Type == conditionBackupRequired {
+			currentStatus = condition.Status
+			lastTransitionTime = condition.LastTransitionTime
+			break
+		}
+	}
+	if lastTransitionTime == "" || currentStatus != status {
+		lastTransitionTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	newCondition := api.Condition{
+		Type:               conditionBackupRequired,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: lastTransitionTime,
+	}
+	if conditions == nil {
+		return []api.Condition{newCondition}
+	}
+	return js.UpsertCondition(conditions, newCondition)
+}
+
+// removeBackupRequiredCondition strips the BackupRequired condition entry
+// entirely from the slice. Use after a successful destructive recreate
+// so the CR's `.status.conditions` doesn't carry the stale gate marker.
+func removeBackupRequiredCondition(conditions []api.Condition) []api.Condition {
+	out := conditions[:0]
+	for _, c := range conditions {
+		if c.Type == conditionBackupRequired {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// backupConfirmedForGeneration reports whether the CR's
+// `metadata.annotations[<annotationKey>]` equals the decimal form of
+// the expected generation. Used as the clear-path predicate for the
+// BackupRequired gate.
+func backupConfirmedForGeneration(annotations map[string]string, annotationKey string, expectedGeneration int64) bool {
+	if annotations == nil {
+		return false
+	}
+	v, ok := annotations[annotationKey]
+	if !ok || v == "" {
+		return false
+	}
+	return v == strconv.FormatInt(expectedGeneration, 10)
+}
+
+// probeCrossRegionStreamMsgs opens a short-lived NATS connection to
+// `serverURL`, queries `streamName` JetStream stream info, and returns
+// the message count + a stream-not-found flag. Returns (0, false, err)
+// on any connection/auth failure so the gate can demand a backup in
+// the "can't confirm" case.
+func probeCrossRegionStreamMsgs(serverURL, credsPath, streamName string, timeout time.Duration) (msgs uint64, exists bool, err error) {
+	opts := []nats.Option{
+		nats.Name("nack-cross-region-probe"),
+		nats.Timeout(timeout),
+		nats.MaxReconnects(0),
+		nats.RetryOnFailedConnect(false),
+	}
+	if credsPath != "" {
+		opts = append(opts, nats.UserCredentials(credsPath))
+	}
+	nc, err := nats.Connect(serverURL, opts...)
+	if err != nil {
+		return 0, false, fmt.Errorf("connect cross-region NATS %s: %w", serverURL, err)
+	}
+	defer nc.Close()
+
+	jsCtx, err := jetstream.New(nc)
+	if err != nil {
+		return 0, false, fmt.Errorf("jetstream client: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	info, err := jsCtx.Stream(ctx, streamName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("stream info %s: %w", streamName, err)
+	}
+	return info.CachedInfo().State.Msgs, true, nil
 }
 
 func compareConfigState(actual any, desired any) string {

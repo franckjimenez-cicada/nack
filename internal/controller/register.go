@@ -27,6 +27,45 @@ type Config struct {
 	//
 	// Defaults to false to preserve upstream behaviour.
 	MirrorRecreateOnConflict bool
+
+	// RequireBackupConfirmation gates the destructive recreate on an
+	// external backup operator confirming that local data has been
+	// captured. When true AND the local server stream has data AND the
+	// cross-region peer can NOT be reached or does NOT have enough
+	// messages, the controller sets a `BackupRequired=True` condition
+	// on the CR and requeues without destroying. An external operator
+	// (e.g. drp-operator) watches the condition, takes a backup, and
+	// records the generation it confirmed via the
+	// BackupConfirmedAnnotation. On the next reconcile, if the
+	// annotation value matches the CR's current Generation, the
+	// controller clears the condition and proceeds with the delete.
+	//
+	// Default false — preserves the v1 mirror-recreate behaviour.
+	RequireBackupConfirmation bool
+
+	// CrossRegionNATSURL is the NATS URL to use for the "is the peer
+	// already holding this data?" pre-destruction probe. Typically the
+	// other region's externally-reachable client port (e.g.
+	// nats://nats-gw.ndev-2nd.mtrade.com.mx:4222 for west's view of
+	// east). Empty disables the probe — when paired with
+	// --require-backup-confirmation=true, that always demands an
+	// external backup confirmation whenever local data is present.
+	CrossRegionNATSURL string
+
+	// CrossRegionNATSCredsPath is the local filesystem path inside the
+	// controller container to the NATS credentials file used for the
+	// cross-region probe. Typically mounted from a K8s Secret. Empty
+	// disables auth — only useful for tests against a local
+	// unauthenticated NATS server.
+	CrossRegionNATSCredsPath string
+
+	// BackupConfirmedAnnotation is the K8s annotation key the
+	// reconciler reads to know that the configured external backup
+	// operator has captured the local stream for the CR's current
+	// Generation. Value must equal the CR's `metadata.generation` (as
+	// a decimal string) to satisfy the gate. Default
+	// "drp.cicada.io/backup-confirmed-generation".
+	BackupConfirmedAnnotation string
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.

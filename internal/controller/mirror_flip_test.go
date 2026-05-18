@@ -15,6 +15,7 @@ import (
 	jsmapi "github.com/nats-io/jsm.go/api"
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	"github.com/nats-io/nats.go/jetstream"
+	v1 "k8s.io/api/core/v1"
 )
 
 func TestStreamMirrorFlipped(t *testing.T) {
@@ -149,5 +150,73 @@ func TestIsMirrorIncompatibleErr(t *testing.T) {
 				t.Fatalf("got %v want %v", got, c.want)
 			}
 		})
+	}
+}
+
+func TestBackupConfirmedForGeneration(t *testing.T) {
+	cases := []struct {
+		name        string
+		annotations map[string]string
+		key         string
+		gen         int64
+		want        bool
+	}{
+		{"nil map", nil, "k", 7, false},
+		{"key missing", map[string]string{"other": "7"}, "k", 7, false},
+		{"value empty", map[string]string{"k": ""}, "k", 7, false},
+		{"value mismatch", map[string]string{"k": "8"}, "k", 7, false},
+		{"value match", map[string]string{"k": "7"}, "k", 7, true},
+		{"non-numeric value mismatch", map[string]string{"k": "seven"}, "k", 7, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := backupConfirmedForGeneration(c.annotations, c.key, c.gen)
+			if got != c.want {
+				t.Fatalf("got %v want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRemoveBackupRequiredCondition(t *testing.T) {
+	in := []api.Condition{
+		{Type: readyCondType, Status: v1.ConditionTrue},
+		{Type: conditionBackupRequired, Status: v1.ConditionTrue, Reason: "PeerStale"},
+		{Type: "Other", Status: v1.ConditionFalse},
+	}
+	out := removeBackupRequiredCondition(in)
+	for _, c := range out {
+		if c.Type == conditionBackupRequired {
+			t.Fatalf("removeBackupRequiredCondition kept the gate condition: %+v", c)
+		}
+	}
+	// other conditions preserved + order preserved
+	if len(out) != 2 {
+		t.Fatalf("expected 2 remaining conditions, got %d (%+v)", len(out), out)
+	}
+	if out[0].Type != readyCondType || out[1].Type != "Other" {
+		t.Fatalf("order not preserved: %+v", out)
+	}
+}
+
+func TestUpdateBackupRequiredCondition_UpsertSemantics(t *testing.T) {
+	// First write seeds the condition.
+	first := updateBackupRequiredCondition(nil, v1.ConditionTrue, "PeerStale", "msg-1")
+	if len(first) != 1 || first[0].Type != conditionBackupRequired || first[0].Status != v1.ConditionTrue || first[0].Reason != "PeerStale" {
+		t.Fatalf("first upsert wrong: %+v", first)
+	}
+	// Second write w/ same status keeps the transition time stable.
+	originalTime := first[0].LastTransitionTime
+	second := updateBackupRequiredCondition(first, v1.ConditionTrue, "PeerStale", "msg-2")
+	if second[0].LastTransitionTime != originalTime {
+		t.Fatalf("transition time should be stable when status unchanged; before=%s after=%s", originalTime, second[0].LastTransitionTime)
+	}
+	if second[0].Message != "msg-2" {
+		t.Fatalf("message not updated: %+v", second[0])
+	}
+	// Third write w/ different status bumps the transition time.
+	third := updateBackupRequiredCondition(second, v1.ConditionFalse, "Done", "cleared")
+	if third[0].LastTransitionTime == originalTime {
+		t.Fatalf("transition time should advance on status change; got %s", third[0].LastTransitionTime)
 	}
 }
