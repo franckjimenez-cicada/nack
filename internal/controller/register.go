@@ -18,6 +18,15 @@ type Config struct {
 	RequeueInterval        time.Duration
 	CacheDir               string
 	HealthProbeBindAddress string
+
+	// MirrorRecreateOnConflict, when true, makes the Stream and KeyValue
+	// reconcilers force-delete the underlying NATS server stream and re-create
+	// it from the K8s CR whenever the spec flips between source-mode and
+	// mirror-mode (or whenever an UpdateConfiguration call returns one of the
+	// mirror-incompatible NATS error codes: 10031 / 10034 / 10055).
+	//
+	// Defaults to false to preserve upstream behaviour.
+	MirrorRecreateOnConflict bool
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.

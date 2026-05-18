@@ -202,6 +202,19 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			return err
 		}
 
+		// Proactive source<->mirror flip handling. See the matching block in
+		// stream_controller.go for the rationale.
+		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, &keyValue.Spec) {
+			log.Info("Source<->mirror flip detected; force-recreating KeyValue.",
+				"specHasMirror", keyValue.Spec.Mirror != nil,
+				"serverHasMirror", serverState.Mirror != nil,
+			)
+			if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
+				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
+			}
+			serverState = nil
+		}
+
 		// Check against known state. Skip Update if converged.
 		// Storing returned state from the server avoids have to
 		// check default values or call Update on already converged resources
@@ -235,15 +248,30 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			log.Info("Updating KeyValue.")
 			updatedKeyValue, err = js.UpdateKeyValue(ctx, targetConfig)
 			if err != nil {
-				return err
-			}
-
-			updatedKeyValue, err := getServerKeyValueState(ctx, js, keyValue)
-			if err != nil {
-				log.Error(err, "Failed to fetch updated KeyValue state")
+				// Reactive fallback: recreate the underlying KV stream when
+				// NATS rejects the update as mirror-incompatible.
+				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					log.Info("UpdateKeyValue rejected by NATS as mirror-incompatible; force-recreating KeyValue.",
+						"err", err.Error(),
+					)
+					if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
+						return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
+					}
+					updatedKeyValue, err = js.CreateKeyValue(ctx, targetConfig)
+					if err != nil {
+						return fmt.Errorf("re-create after mirror-incompatible update: %w", err)
+					}
+				} else {
+					return err
+				}
 			} else {
-				diff := compareConfigState(updatedKeyValue, serverState)
-				log.Info("Updated KeyValue.", "diff", diff)
+				refreshed, err := getServerKeyValueState(ctx, js, keyValue)
+				if err != nil {
+					log.Error(err, "Failed to fetch updated KeyValue state")
+				} else {
+					diff := compareConfigState(refreshed, serverState)
+					log.Info("Updated KeyValue.", "diff", diff)
+				}
 			}
 		} else {
 			log.Info("Skipping KeyValue update.",
@@ -405,4 +433,15 @@ func (r *KeyValueReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(r)
+}
+
+// keyValueMirrorFlipped reports whether the desired KeyValue spec disagrees
+// with the server-side KV stream config on whether it is a mirror.
+func keyValueMirrorFlipped(serverState *jetstream.StreamConfig, spec *api.KeyValueSpec) bool {
+	if serverState == nil || spec == nil {
+		return false
+	}
+	serverHasMirror := serverState.Mirror != nil
+	specHasMirror := spec.Mirror != nil
+	return serverHasMirror != specHasMirror
 }

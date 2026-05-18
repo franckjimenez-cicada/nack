@@ -28,6 +28,14 @@ import (
 const (
 	JSConsumerNotFoundErr uint16 = 10014
 	JSStreamNotFoundErr   uint16 = 10059
+
+	// Errors emitted by the NATS server when an in-place UpdateConfiguration
+	// would have to flip a Stream between source-mode and mirror-mode. NATS
+	// forbids this on an existing stream; recovery requires deleting the
+	// server-side stream and re-creating it from the desired spec.
+	JSStreamMirrorWithSourcesErr  uint16 = 10031
+	JSStreamMirrorWithSubjectsErr uint16 = 10034
+	JSStreamMirrorInvalidErr      uint16 = 10055
 )
 
 var semVerRe = regexp.MustCompile(`\Av?([0-9]+)\.?([0-9]+)?\.?([0-9]+)?`)
@@ -53,6 +61,12 @@ type JetStreamController interface {
 	WithJSMClient(opts api.ConnectionOpts, ns string, op func(jsm *jsm.Manager) error) error
 
 	RequeueInterval() time.Duration
+
+	// MirrorRecreateOnConflict returns true when the controller should force-
+	// delete a Stream / KeyValue underlying stream and re-create it from the
+	// K8s CR when a source<->mirror flip is detected, instead of letting
+	// UpdateConfiguration silently retry forever.
+	MirrorRecreateOnConflict() bool
 }
 
 func NewJSController(k8sClient client.Client, natsConfig *NatsConfig, controllerConfig *Config) (JetStreamController, error) {
@@ -88,6 +102,10 @@ func (c *jsController) RequeueInterval() time.Duration {
 
 func (c *jsController) ReadOnly() bool {
 	return c.controllerConfig.ReadOnly
+}
+
+func (c *jsController) MirrorRecreateOnConflict() bool {
+	return c.controllerConfig.MirrorRecreateOnConflict
 }
 
 func (c *jsController) ValidNamespace(namespace string) bool {

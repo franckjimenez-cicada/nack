@@ -200,6 +200,25 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			return fmt.Errorf("map spec to stream targetConfig: %w", err)
 		}
 
+		// Proactive source<->mirror flip handling.
+		//
+		// NATS forbids switching an existing stream between source-mode (no
+		// spec.mirror, possibly with subjects) and mirror-mode (spec.mirror
+		// set) via UpdateConfiguration. If we see the CR has flipped relative
+		// to the server, the only correct path is to delete the server stream
+		// and re-create from the CR. This is opt-in to preserve upstream
+		// semantics.
+		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, &stream.Spec) {
+			log.Info("Source<->mirror flip detected; force-recreating Stream.",
+				"specHasMirror", stream.Spec.Mirror != nil,
+				"serverHasMirror", serverState.Mirror != nil,
+			)
+			if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
+				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
+			}
+			serverState = nil
+		}
+
 		// Check against known state. Skip Update if converged.
 		// Storing returned state from the server avoids have to
 		// check default values or call Update on already converged resources
@@ -238,16 +257,32 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 
 			err = s.UpdateConfiguration(*serverState, targetConfig...)
 			if err != nil {
-				return err
-			}
+				// Reactive fallback: if NATS rejects because the requested
+				// change requires source<->mirror flip, force-delete and
+				// re-create. Bounded to a single retry.
+				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					log.Info("UpdateConfiguration rejected by NATS as mirror-incompatible; force-recreating Stream.",
+						"err", err.Error(),
+					)
+					if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
+						return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
+					}
+					updatedStream, err = js.NewStream(stream.Spec.Name, targetConfig...)
+					if err != nil {
+						return fmt.Errorf("re-create after mirror-incompatible update: %w", err)
+					}
+				} else {
+					return err
+				}
+			} else {
+				updatedStream, err = js.LoadStream(stream.Spec.Name)
+				if err != nil {
+					return err
+				}
 
-			updatedStream, err = js.LoadStream(stream.Spec.Name)
-			if err != nil {
-				return err
+				diff := compareConfigState(updatedStream.Configuration(), *serverState)
+				log.Info("Updated Stream.", "diff", diff)
 			}
-
-			diff := compareConfigState(updatedStream.Configuration(), *serverState)
-			log.Info("Updated Stream.", "diff", diff)
 		} else {
 			log.Info("Skipping Stream update.",
 				"preventUpdate", stream.Spec.PreventUpdate,
@@ -681,4 +716,29 @@ func (r *StreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(r)
+}
+
+// streamMirrorFlipped reports whether the desired stream spec disagrees with
+// the server-side stream config on whether it is a mirror. NATS forbids
+// changing this on an existing stream — the only correct path is to delete
+// and re-create.
+func streamMirrorFlipped(serverState *jsmapi.StreamConfig, spec *api.StreamSpec) bool {
+	if serverState == nil || spec == nil {
+		return false
+	}
+	serverHasMirror := serverState.Mirror != nil
+	specHasMirror := spec.Mirror != nil
+	return serverHasMirror != specHasMirror
+}
+
+// isMirrorIncompatibleErr returns true for NATS API errors emitted when an
+// in-place stream update would require flipping between source-mode and
+// mirror-mode (10031 / 10034 / 10055).
+func isMirrorIncompatibleErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return jsmapi.IsNatsErr(err, JSStreamMirrorInvalidErr) ||
+		jsmapi.IsNatsErr(err, JSStreamMirrorWithSubjectsErr) ||
+		jsmapi.IsNatsErr(err, JSStreamMirrorWithSourcesErr)
 }

@@ -82,6 +82,7 @@ func run() error {
 	controlLoop := flag.Bool("control-loop", false, "Experimental: Run controller with a full reconciliation control loop")
 	controlLoopSyncInterval := flag.Duration("sync-interval", time.Minute, "Interval to perform scheduled reconcile")
 	healthProbeBindAddress := flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to")
+	mirrorRecreateOnConflict := flag.Bool("mirror-recreate-on-conflict", false, "Force-delete and re-create a Stream / KeyValue underlying NATS stream when the K8s spec flips between source-mode and mirror-mode, or when UpdateConfiguration returns a mirror-incompatible NATS error (10031 / 10034 / 10055). Off by default to preserve upstream semantics; opt in for DRP-style failover workflows where the only correct recovery is a clean recreate.")
 
 	flag.Parse()
 
@@ -118,11 +119,12 @@ func run() error {
 		}
 
 		controllerCfg := &controller.Config{
-			ReadOnly:               *readOnly,
-			Namespace:              *namespace,
-			CacheDir:               *cacheDir,
-			RequeueInterval:        *controlLoopSyncInterval,
-			HealthProbeBindAddress: *healthProbeBindAddress,
+			ReadOnly:                 *readOnly,
+			Namespace:                *namespace,
+			CacheDir:                 *cacheDir,
+			RequeueInterval:          *controlLoopSyncInterval,
+			HealthProbeBindAddress:   *healthProbeBindAddress,
+			MirrorRecreateOnConflict: *mirrorRecreateOnConflict,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)
@@ -146,20 +148,21 @@ func run() error {
 	ctrl := jetstream.NewController(jetstream.Options{
 		// FIXME: Move context to be param from Run
 		// to avoid keeping state in options.
-		Ctx:             ctx,
-		NATSCredentials: *creds,
-		NATSNKey:        *nkey,
-		NATSServerURL:   *server,
-		NATSCA:          *ca,
-		NATSCertificate: *cert,
-		NATSKey:         *key,
-		NATSTLSFirst:    *tlsfirst,
-		KubeIface:       kc,
-		JetstreamIface:  jc,
-		Namespace:       *namespace,
-		CRDConnect:      *crdConnect,
-		CleanupPeriod:   *cleanupPeriod,
-		ReadOnly:        *readOnly,
+		Ctx:                      ctx,
+		NATSCredentials:          *creds,
+		NATSNKey:                 *nkey,
+		NATSServerURL:            *server,
+		NATSCA:                   *ca,
+		NATSCertificate:          *cert,
+		NATSKey:                  *key,
+		NATSTLSFirst:             *tlsfirst,
+		KubeIface:                kc,
+		JetstreamIface:           jc,
+		Namespace:                *namespace,
+		CRDConnect:               *crdConnect,
+		CleanupPeriod:            *cleanupPeriod,
+		ReadOnly:                 *readOnly,
+		MirrorRecreateOnConflict: *mirrorRecreateOnConflict,
 	})
 
 	klog.Infof("Starting %s v%s...", os.Args[0], Version)
