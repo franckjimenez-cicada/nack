@@ -47,6 +47,38 @@ import (
 // a drill (value = drillID for audit), then clears it on completion.
 const DrillActiveAnnotation = "drp.cicada.io/drill-active"
 
+// NATSAccountLabel identifies which NATS account a Stream/KeyValue CR
+// targets. Two CRs with the same `spec.name` but DIFFERENT account labels
+// resolve to different server-side streams (one per account) and therefore
+// do NOT conflict at the NATS layer.
+//
+// Our chart sets values like "JS" or "nats-qa". The label is OPTIONAL: when
+// absent on either side, we fall back to the conservative legacy behavior
+// (treat as potential conflict) so this change is backward-compatible.
+const NATSAccountLabel = "drp.cicada.io/nats-account"
+
+// accountLabel returns (value, present) for the NATS account label on an
+// object's metadata. A nil map or missing key returns ("", false).
+func accountLabel(labels map[string]string) (string, bool) {
+	if labels == nil {
+		return "", false
+	}
+	v, ok := labels[NATSAccountLabel]
+	return v, ok && v != ""
+}
+
+// differentAccounts returns true iff BOTH sides carry the account label and
+// the values differ. When either side is unlabeled we return false so the
+// caller falls through to the legacy conflict logic (conservative default).
+func differentAccounts(selfLabels, otherLabels map[string]string) bool {
+	selfAcc, selfOK := accountLabel(selfLabels)
+	otherAcc, otherOK := accountLabel(otherLabels)
+	if !selfOK || !otherOK {
+		return false
+	}
+	return selfAcc != otherAcc
+}
+
 // remediationHint is appended to every rejection so operators understand
 // what to do — the most common cause is an ArgoCD app drifting to autosync.
 const remediationHint = "Only the drp-operator may create conflicting CRs during a coordinated drill. " +
@@ -119,6 +151,14 @@ func findStreamConflict(ctx context.Context, c ctrlclient.Client, self *api.Stre
 			continue // self
 		}
 
+		// account-aware filter: same spec.name across different NATS
+		// accounts is NOT a conflict (separate server-side streams).
+		// Only applies when BOTH CRs are labeled; absent labels fall
+		// through to the legacy logic (backward compatible).
+		if differentAccounts(self.Labels, other.Labels) {
+			continue
+		}
+
 		otherName := streamSpecName(other)
 		otherMirror := streamMirrorSource(other)
 
@@ -155,6 +195,10 @@ func findKeyValueConflict(ctx context.Context, c ctrlclient.Client, self *api.Ke
 	for i := range list.Items {
 		other := &list.Items[i]
 		if other.Name == self.Name {
+			continue
+		}
+		// account-aware filter (see findStreamConflict for rationale).
+		if differentAccounts(self.Labels, other.Labels) {
 			continue
 		}
 		if keyValueSpecName(other) == selfBucket {
