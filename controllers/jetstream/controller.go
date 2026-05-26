@@ -83,6 +83,10 @@ type Options struct {
 	CleanupPeriod time.Duration
 	ReadOnly      bool
 
+	// MirrorRecreateOnConflict mirrors internal/controller.Config.MirrorRecreateOnConflict
+	// for the legacy controller path. See its docstring there.
+	MirrorRecreateOnConflict bool
+
 	Recorder record.EventRecorder
 }
 

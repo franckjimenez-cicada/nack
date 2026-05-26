@@ -124,8 +124,25 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsm jsmClientFunc) (e
 			return nil
 		}
 		c.normalEvent(str, "Updating", fmt.Sprintf("Updating stream %q", spec.Name))
-		if err := natsClientUtil(updateStream); err != nil {
-			return err
+		if updErr := natsClientUtil(updateStream); updErr != nil {
+			// Reactive recreate: when the NATS server rejects the in-place
+			// update because the requested change would flip the stream
+			// between source-mode and mirror-mode, the only correct path is
+			// to delete the server stream and recreate it from the spec.
+			// Opt-in via --mirror-recreate-on-conflict.
+			if c.opts.MirrorRecreateOnConflict && isMirrorIncompatibleStreamErr(updErr) {
+				c.normalEvent(str, "RecreatingOnMirrorFlip",
+					fmt.Sprintf("Update of stream %q rejected by NATS as mirror-incompatible; force-recreating.", spec.Name),
+				)
+				if delErr := natsClientUtil(deleteStream); delErr != nil {
+					return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
+				}
+				if createErr := natsClientUtil(createStream); createErr != nil {
+					return fmt.Errorf("re-create after mirror-incompatible update: %w", createErr)
+				}
+			} else {
+				return updErr
+			}
 		}
 
 		if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
@@ -669,4 +686,30 @@ func getStreamSource(ss *apis.StreamSource) (*jsmapi.StreamSource, error) {
 	}
 
 	return jss, nil
+}
+
+// NATS API error codes returned when an in-place stream update would require
+// flipping between source-mode and mirror-mode. The only recovery is to
+// delete and re-create the stream from the spec.
+const (
+	jsStreamMirrorWithSourcesErr  uint16 = 10031
+	jsStreamMirrorWithSubjectsErr uint16 = 10034
+	jsStreamMirrorInvalidErr      uint16 = 10055
+)
+
+// isMirrorIncompatibleStreamErr unwraps the chain looking for a NATS API
+// error matching one of the mirror-flip rejection codes.
+func isMirrorIncompatibleStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apierr jsmapi.ApiError
+	if !errors.As(err, &apierr) {
+		return false
+	}
+	switch apierr.NatsErrorCode() {
+	case jsStreamMirrorInvalidErr, jsStreamMirrorWithSubjectsErr, jsStreamMirrorWithSourcesErr:
+		return true
+	}
+	return false
 }
