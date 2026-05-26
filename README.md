@@ -16,6 +16,7 @@
   - [Creating NATS Resources](#creating-nats-resources)
   - [Getting Started with Accounts](#getting-started-with-accounts)
   - [Local Development](#local-development)
+  - [Sibling-Conflict Admission Webhook](#sibling-conflict-admission-webhook)
 - [NATS Server Config Reloader](#nats-server-config-reloader)
 - [NATS Boot Config](#nats-boot-config)
 
@@ -470,6 +471,53 @@ Build Docker image
 ```sh
 make jetstream-controller-docker ver=1.2.3
 ```
+
+### Sibling-Conflict Admission Webhook
+
+> **Fork-only feature** — not in upstream nats-io/nack.
+
+The jetstream-controller can optionally serve a `ValidatingAdmissionWebhook`
+that rejects creation/update of `Stream` and `KeyValue` CRs whose `spec.name`
+(or `spec.mirror.name`) conflicts with another CR of the same kind in the
+same namespace.
+
+**Why:** during NATS DR drills (or worse, an ArgoCD app drifting to
+`syncPolicy.automated=on` during failback) it is easy to end up with a
+primary CR and a mirror CR pointing at the same on-wire stream — the
+controller then ping-pongs between source-of-truth and mirror config every
+reconcile cycle. The `--mirror-recreate-on-conflict` flag handles the
+steady-state case; this webhook stops the bad CR from being admitted in the
+first place, regardless of how it was created.
+
+**How it works:**
+
+1. On `CREATE`/`UPDATE` of a `Stream`, the webhook lists every other
+   `Stream` in the same namespace and rejects if any sibling has
+   - the same `spec.name`, or
+   - a `spec.mirror.name` equal to self's `spec.name`, or
+   - a `spec.name` equal to self's `spec.mirror.name`
+2. Same logic for `KeyValue`, keyed on `spec.bucket`.
+3. **Override:** if the target namespace has annotation
+   `drp.cicada.io/drill-active=<drillID>`, the webhook allows the request
+   and emits a warning. The `drp-operator` sets this annotation for the
+   duration of a coordinated drill and clears it on completion.
+
+**Enabling:**
+
+```sh
+jetstream-controller \
+  --control-loop \
+  --enable-sibling-webhook \
+  --webhook-port=9443 \
+  --webhook-cert-dir=/tmp/k8s-webhook-server/serving-certs
+```
+
+The deployment + cert-manager `Certificate` + `ValidatingWebhookConfiguration`
+manifests live in `deploy/webhook.yml`. Downstream Helm charts should expose
+a `webhook.enabled` value (default `false`) gating the rendering of those
+manifests.
+
+**Tests:** `go test ./internal/webhook/... -count=1`
 
 ## NATS Server Config Reloader
 

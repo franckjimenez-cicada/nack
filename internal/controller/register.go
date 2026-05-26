@@ -18,6 +18,13 @@ type Config struct {
 	RequeueInterval        time.Duration
 	CacheDir               string
 	HealthProbeBindAddress string
+
+	// EnableSiblingWebhook turns on the Stream/KeyValue sibling-conflict
+	// admission webhook (control-loop mode only). When true, WebhookPort
+	// and WebhookCertDir are honored.
+	EnableSiblingWebhook bool
+	WebhookPort          int
+	WebhookCertDir       string
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.
