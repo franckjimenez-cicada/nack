@@ -65,11 +65,25 @@ func newStream(metaName, specName string, mirror *api.StreamSource) *api.Stream 
 	}
 }
 
+// newStreamWithAccount builds a Stream CR with the drp.cicada.io/nats-account
+// label set. Used by account-aware sibling-check tests.
+func newStreamWithAccount(metaName, specName, account string) *api.Stream {
+	s := newStream(metaName, specName, nil)
+	s.Labels = map[string]string{NATSAccountLabel: account}
+	return s
+}
+
 func newKV(metaName, bucket string) *api.KeyValue {
 	return &api.KeyValue{
 		ObjectMeta: metav1.ObjectMeta{Name: metaName, Namespace: testNS},
 		Spec:       api.KeyValueSpec{Bucket: bucket},
 	}
+}
+
+func newKVWithAccount(metaName, bucket, account string) *api.KeyValue {
+	kv := newKV(metaName, bucket)
+	kv.Labels = map[string]string{NATSAccountLabel: account}
+	return kv
 }
 
 func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
@@ -227,4 +241,96 @@ func TestStreamValidator_ValidateDelete_AlwaysAllow(t *testing.T) {
 	v := &StreamValidator{Client: c}
 	_, err := v.ValidateDelete(context.Background(), newStream("any", "ANY", nil))
 	require.NoError(t, err)
+}
+
+// --- account-aware sibling-check (2026-05-26) ---------------------------
+
+// Same spec.name but DIFFERENT NATS accounts => not a conflict.
+// This is the bug from the failover-js--drp-orchestrator-rkpvx drill:
+// activitylog-dev-2nd-east (account=JS) was rejected because
+// activitylog-qa-2nd-east (account=nats-qa) also had spec.name="activitylog".
+func TestStreamValidator_SameSpecName_DifferentAccounts_Allow(t *testing.T) {
+	existing := newStreamWithAccount("activitylog-qa-2nd-east", "activitylog", "nats-qa")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c}
+
+	self := newStreamWithAccount("activitylog-dev-2nd-east", "activitylog", "JS")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.NoError(t, err, "different NATS accounts must not collide")
+}
+
+// Same spec.name AND same NATS account label => still a conflict.
+func TestStreamValidator_SameSpecName_SameAccount_Reject(t *testing.T) {
+	existing := newStreamWithAccount("orders-primary", "ORDERS", "JS")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c}
+
+	self := newStreamWithAccount("orders-mirror", "ORDERS", "JS")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ORDERS")
+}
+
+// Neither CR carries the label => fall through to legacy conflict logic
+// (backward compatibility). Verified separately from the labeled cases.
+func TestStreamValidator_SameSpecName_NoAccountLabel_Reject(t *testing.T) {
+	existing := newStream("orders-primary", "ORDERS", nil)
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c}
+
+	self := newStream("orders-mirror", "ORDERS", nil)
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err, "unlabeled CRs must keep legacy conservative behavior")
+}
+
+// Only one side labeled => conservative: still a conflict (we can't prove
+// the other side belongs to a different account, so reject).
+func TestStreamValidator_SameSpecName_OneSideLabeled_Reject(t *testing.T) {
+	existing := newStreamWithAccount("orders-primary", "ORDERS", "JS")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c}
+
+	self := newStream("orders-mirror", "ORDERS", nil) // unlabeled
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err, "missing label on one side must NOT relax the check")
+}
+
+// Mirror-relationship rules (rule 2/3) also respect the account filter.
+func TestStreamValidator_MirrorAcrossDifferentAccounts_Allow(t *testing.T) {
+	// sibling is a mirror of "ORDERS" but in account nats-qa.
+	mirror := &api.Stream{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "orders-mirror",
+			Namespace: testNS,
+			Labels:    map[string]string{NATSAccountLabel: "nats-qa"},
+		},
+		Spec: api.StreamSpec{Name: "ORDERS-MIRROR", Mirror: &api.StreamSource{Name: "ORDERS"}},
+	}
+	c := newFakeClient(t, newNamespace(testNS, ""), mirror)
+	v := &StreamValidator{Client: c}
+
+	self := newStreamWithAccount("orders-primary", "ORDERS", "JS")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.NoError(t, err, "mirror across different accounts is not a conflict")
+}
+
+func TestKeyValueValidator_SameBucket_DifferentAccounts_Allow(t *testing.T) {
+	existing := newKVWithAccount("config-qa", "CONFIG", "nats-qa")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &KeyValueValidator{Client: c}
+
+	self := newKVWithAccount("config-js", "CONFIG", "JS")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.NoError(t, err)
+}
+
+func TestKeyValueValidator_SameBucket_SameAccount_Reject(t *testing.T) {
+	existing := newKVWithAccount("config-primary", "CONFIG", "JS")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &KeyValueValidator{Client: c}
+
+	self := newKVWithAccount("config-mirror", "CONFIG", "JS")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "CONFIG")
 }

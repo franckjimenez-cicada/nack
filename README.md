@@ -496,8 +496,17 @@ first place, regardless of how it was created.
    - the same `spec.name`, or
    - a `spec.mirror.name` equal to self's `spec.name`, or
    - a `spec.name` equal to self's `spec.mirror.name`
-2. Same logic for `KeyValue`, keyed on `spec.bucket`.
-3. **Override:** if the target namespace has annotation
+2. **Account-aware filter:** before applying the rules above the webhook
+   compares the `drp.cicada.io/nats-account` label on both CRs. If BOTH
+   sides carry the label AND the values differ, the sibling is skipped —
+   different NATS accounts resolve to different server-side streams, so
+   there is no real conflict. When either side is unlabeled the webhook
+   falls through to the legacy logic (conservative default, backward
+   compatible). This avoids false rejections of CRs like
+   `activitylog-dev-2nd-east` (account `JS`) vs `activitylog-qa-2nd-east`
+   (account `nats-qa`).
+3. Same logic for `KeyValue`, keyed on `spec.bucket`.
+4. **Override:** if the target namespace has annotation
    `drp.cicada.io/drill-active=<drillID>`, the webhook allows the request
    and emits a warning. The `drp-operator` sets this annotation for the
    duration of a coordinated drill and clears it on completion.
