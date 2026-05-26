@@ -1,0 +1,105 @@
+# Sibling-conflict admission webhook for Stream and KeyValue CRs.
+#
+# Rejects creation/update of a Stream or KeyValue CR whose spec.name (or
+# spec.mirror.name) collides with another CR of the same kind in the same
+# namespace, UNLESS the namespace carries
+# `drp.cicada.io/drill-active=<drillID>` (set by drp-operator during a drill).
+#
+# This file is the deploy equivalent of a Helm chart's templates/webhook.yaml.
+# A downstream chart can re-template these manifests with values.yaml gates
+# (e.g. webhook.enabled=false by default; consumer flips it to true).
+#
+# Prereqs:
+#   - cert-manager installed in cluster
+#   - jetstream-controller started with --enable-sibling-webhook=true
+#   - jetstream-controller Service named "jetstream-controller-webhook" on
+#     port 9443 (see Service below)
+#
+# To disable in a chart: skip rendering this entire file (`{{- if
+# .Values.webhook.enabled -}}` wrapper).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jetstream-controller-webhook
+  namespace: default
+  labels:
+    app.kubernetes.io/name: jetstream-controller
+    app.kubernetes.io/component: webhook
+spec:
+  selector:
+    app.kubernetes.io/name: jetstream-controller
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9443
+      protocol: TCP
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: jetstream-controller-selfsigned
+  namespace: default
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: jetstream-controller-webhook-cert
+  namespace: default
+spec:
+  secretName: jetstream-controller-webhook-cert
+  dnsNames:
+    - jetstream-controller-webhook.default.svc
+    - jetstream-controller-webhook.default.svc.cluster.local
+  issuerRef:
+    name: jetstream-controller-selfsigned
+    kind: Issuer
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: jetstream-controller-sibling-conflict
+  annotations:
+    # cert-manager injects ca.crt of the Secret above into each webhook's
+    # clientConfig.caBundle. Without this, the apiserver rejects the TLS handshake.
+    cert-manager.io/inject-ca-from: default/jetstream-controller-webhook-cert
+webhooks:
+  - name: streams.sibling-conflict.jetstream.nats.io
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    # Fail closed: if the webhook is unreachable, reject the CR. This is the
+    # safe default — the bug we're guarding against (silent reconcile war on
+    # drift) is worse than admission downtime.
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["jetstream.nats.io"]
+        apiVersions: ["v1beta2"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["streams"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: jetstream-controller-webhook
+        namespace: default
+        path: /validate-jetstream-nats-io-v1beta2-stream
+        port: 443
+  - name: keyvalues.sibling-conflict.jetstream.nats.io
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["jetstream.nats.io"]
+        apiVersions: ["v1beta2"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["keyvalues"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: jetstream-controller-webhook
+        namespace: default
+        path: /validate-jetstream-nats-io-v1beta2-keyvalue
+        port: 443

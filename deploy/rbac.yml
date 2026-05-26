@@ -26,6 +26,16 @@ rules:
   - get
   - watch
   - list
+# Required by the sibling-conflict admission webhook to read the
+# drp.cicada.io/drill-active annotation on the request's namespace.
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - jetstream.nats.io
   resources:

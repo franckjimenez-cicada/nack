@@ -26,6 +26,7 @@ import (
 
 	"github.com/nats-io/nack/controllers/jetstream"
 	"github.com/nats-io/nack/internal/controller"
+	"github.com/nats-io/nack/internal/webhook"
 	v1beta2 "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	clientset "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +41,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
 var (
@@ -82,6 +84,9 @@ func run() error {
 	controlLoop := flag.Bool("control-loop", false, "Experimental: Run controller with a full reconciliation control loop")
 	controlLoopSyncInterval := flag.Duration("sync-interval", time.Minute, "Interval to perform scheduled reconcile")
 	healthProbeBindAddress := flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to")
+	enableWebhook := flag.Bool("enable-sibling-webhook", false, "Enable the Stream/KeyValue sibling-conflict admission webhook (control-loop mode only)")
+	webhookPort := flag.Int("webhook-port", 9443, "Webhook server bind port")
+	webhookCertDir := flag.String("webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Webhook server TLS cert directory")
 
 	flag.Parse()
 
@@ -123,6 +128,9 @@ func run() error {
 			CacheDir:               *cacheDir,
 			RequeueInterval:        *controlLoopSyncInterval,
 			HealthProbeBindAddress: *healthProbeBindAddress,
+			EnableSiblingWebhook:   *enableWebhook,
+			WebhookPort:            *webhookPort,
+			WebhookCertDir:         *webhookCertDir,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)
@@ -185,6 +193,13 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 		HealthProbeBindAddress: controllerCfg.HealthProbeBindAddress,
 	}
 
+	if controllerCfg.EnableSiblingWebhook {
+		ctrlOpts.WebhookServer = ctrlwebhook.NewServer(ctrlwebhook.Options{
+			Port:    controllerCfg.WebhookPort,
+			CertDir: controllerCfg.WebhookCertDir,
+		})
+	}
+
 	if controllerCfg.Namespace != "" {
 		ctrlOpts.Cache = cache.Options{
 			DefaultNamespaces: map[string]cache.Config{
@@ -221,6 +236,13 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 	err = controller.RegisterAll(mgr, natsCfg, controllerCfg)
 	if err != nil {
 		return fmt.Errorf("register jetstream controllers: %w", err)
+	}
+
+	if controllerCfg.EnableSiblingWebhook {
+		if err := webhook.SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("register sibling-conflict webhook: %w", err)
+		}
+		klog.Info("sibling-conflict admission webhook enabled")
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
