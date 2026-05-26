@@ -1,0 +1,35 @@
+#syntax=docker/dockerfile:1.13
+#
+# Minimal package-only Dockerfile for forks that cross-compile the
+# binary on the host (no Go toolchain inside the build context).
+#
+# Build with:
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+#     -tags timetzdata -o ./bin/jetstream-controller-amd64 \
+#     ./cmd/jetstream-controller
+#   docker build -f cicd/Dockerfile.copy \
+#     --build-arg BIN=./bin/jetstream-controller-amd64 \
+#     -t <registry>/<repo>:<tag> .
+
+ARG ALPINE_VERSION=3.23
+ARG BIN=jetstream-controller-amd64
+
+FROM alpine:${ALPINE_VERSION}
+
+ARG BIN
+ARG TARGETPLATFORM
+
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S nack && adduser -S -G nack nack
+
+COPY ${BIN} /usr/local/bin/jetstream-controller
+COPY cicd/assets/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh /usr/local/bin/jetstream-controller && \
+    ln -s /usr/local/bin/jetstream-controller /jetstream-controller
+
+USER nack
+
+ENV GO_APP=jetstream-controller
+
+ENTRYPOINT ["/entrypoint.sh"]
