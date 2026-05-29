@@ -25,6 +25,17 @@ import (
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 )
 
+// Options is the parameter bag for SetupWithManager. Kept as a struct so
+// future per-webhook knobs (e.g. additional bypass SAs, opt-in dry-run
+// mode) can be added without changing the function signature.
+type Options struct {
+	// DRPOperatorSA is the ServiceAccount username allowed to mutate
+	// scope-labeled CRs while a drill-active annotation is set on the
+	// namespace. Format: `system:serviceaccount:<ns>:<sa>`. Empty falls
+	// back to DefaultDRPOperatorServiceAccount.
+	DRPOperatorSA string
+}
+
 // SetupWithManager registers the Stream + KeyValue sibling-conflict validators
 // on mgr's webhook server. The webhook server bind address / certs are
 // configured upstream via ctrl.Options.WebhookServer.
@@ -35,7 +46,7 @@ import (
 //
 // These paths must match the clientConfig.service.path in the
 // ValidatingWebhookConfiguration manifest (see deploy/webhook.yml).
-func SetupWithManager(mgr ctrl.Manager) error {
+func SetupWithManager(mgr ctrl.Manager, opts Options) error {
 	scheme := mgr.GetScheme()
 	srv := mgr.GetWebhookServer()
 	if srv == nil {
@@ -44,11 +55,17 @@ func SetupWithManager(mgr ctrl.Manager) error {
 
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-stream",
-		admission.WithValidator[*api.Stream](scheme, &StreamValidator{Client: mgr.GetClient()}),
+		admission.WithValidator[*api.Stream](scheme, &StreamValidator{
+			Client:        mgr.GetClient(),
+			DRPOperatorSA: opts.DRPOperatorSA,
+		}),
 	)
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-keyvalue",
-		admission.WithValidator[*api.KeyValue](scheme, &KeyValueValidator{Client: mgr.GetClient()}),
+		admission.WithValidator[*api.KeyValue](scheme, &KeyValueValidator{
+			Client:        mgr.GetClient(),
+			DRPOperatorSA: opts.DRPOperatorSA,
+		}),
 	)
 
 	return nil

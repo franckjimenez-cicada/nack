@@ -73,6 +73,13 @@ type Config struct {
 	// a decimal string) to satisfy the gate. Default
 	// "drp.cicada.io/backup-confirmed-generation".
 	BackupConfirmedAnnotation string
+
+	// DRPOperatorSA is the ServiceAccount username the drill-active
+	// operator-only admission gate treats as the allowed writer on
+	// scope-labeled CRs while a drill is in flight. Format:
+	// `system:serviceaccount:<ns>:<sa>`. Empty falls back to
+	// webhook.DefaultDRPOperatorServiceAccount.
+	DRPOperatorSA string
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.

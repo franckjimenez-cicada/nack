@@ -29,6 +29,7 @@ import (
 	"github.com/nats-io/nack/internal/webhook"
 	v1beta2 "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	clientset "github.com/nats-io/nack/pkg/jetstream/generated/clientset/versioned"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/client-go/rest"
 	klog "k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -92,6 +94,8 @@ func run() error {
 	crossRegionNATSURL := flag.String("cross-region-nats-url", "", "NATS URL used by --require-backup-confirmation to probe whether the peer region already holds this stream's data. Empty disables the probe — every destructive recreate against a stream with local data will demand external backup confirmation.")
 	crossRegionNATSCredsPath := flag.String("cross-region-nats-creds-path", "", "Local filesystem path inside the controller container to the NATS credentials file used for the cross-region probe. Typically mounted from a K8s Secret. Empty disables auth.")
 	backupConfirmedAnnotation := flag.String("backup-confirmed-annotation", "drp.cicada.io/backup-confirmed-generation", "Annotation key the controller reads to know an external backup operator has captured the CR's local state. Value must equal the CR's metadata.generation as a decimal string.")
+	drpOperatorSA := flag.String("drp-operator-sa", webhook.DefaultDRPOperatorServiceAccount,
+		"ServiceAccount username (format `system:serviceaccount:<ns>:<sa>`) allowed to mutate scope-labeled Stream/KeyValue CRs while the namespace carries the drill-active annotation. Defaults to the dev/stg convention; override for prod or other environments where drp-operator runs under a different namespace/SA.")
 
 	flag.Parse()
 
@@ -141,6 +145,7 @@ func run() error {
 			CrossRegionNATSURL:        *crossRegionNATSURL,
 			CrossRegionNATSCredsPath:  *crossRegionNATSCredsPath,
 			BackupConfirmedAnnotation: *backupConfirmedAnnotation,
+			DRPOperatorSA:             *drpOperatorSA,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)
@@ -217,7 +222,22 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 				controllerCfg.Namespace: {},
 			},
 		}
+		// The drill-active operator-only gate reads
+		// corev1.Namespace objects to check the drill-active
+		// annotation. Namespaces are cluster-scoped, so the
+		// DefaultNamespaces scoping above would prevent them from
+		// being cached / watched — every admission call would
+		// fall back to a direct apiserver Get. Pin Namespace via
+		// ByObject with an empty Namespaces map to keep it
+		// cluster-wide-cached even when the rest of the manager
+		// is namespace-scoped.
+		ctrlOpts.Cache.ByObject = map[ctrlclient.Object]cache.ByObject{
+			&corev1.Namespace{}: {},
+		}
 	}
+	// When controllerCfg.Namespace is empty the manager already caches
+	// every resource cluster-wide (including Namespace), so no extra
+	// wiring is needed here — the gate's Get hits the cache directly.
 
 	mgr, err := ctrl.NewManager(config, ctrlOpts)
 	if err != nil {
@@ -250,10 +270,13 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 	}
 
 	if controllerCfg.EnableSiblingWebhook {
-		if err := webhook.SetupWithManager(mgr); err != nil {
+		if err := webhook.SetupWithManager(mgr, webhook.Options{
+			DRPOperatorSA: controllerCfg.DRPOperatorSA,
+		}); err != nil {
 			return fmt.Errorf("register sibling-conflict webhook: %w", err)
 		}
-		klog.Info("sibling-conflict admission webhook enabled")
+		klog.Infof("sibling-conflict admission webhook enabled (drp-operator SA: %q)",
+			controllerCfg.DRPOperatorSA)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
