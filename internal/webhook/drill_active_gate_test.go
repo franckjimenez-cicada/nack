@@ -45,6 +45,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
@@ -65,6 +66,13 @@ func scopedKV(metaName, bucket string) *api.KeyValue {
 	kv := newKV(metaName, bucket)
 	kv.Labels = map[string]string{ScopeLabel: "true"}
 	return kv
+}
+
+// callGate is a thin wrapper that lets the matrix-style tests below stay
+// compact while still threading the configurable operator-SA through. Most
+// tests pin the canonical default; the configured-SA test below overrides.
+func callGate(ctx context.Context, c ctrlclient.Client, obj objectLabels) (bool, string, string, error) {
+	return drillActiveOperatorGate(ctx, c, obj, DefaultDRPOperatorServiceAccount)
 }
 
 // ctxWithUser threads an admission.Request carrying the given username onto
@@ -112,7 +120,7 @@ func TestDrillActiveGate_NoDrill_AllowAnyone(t *testing.T) {
 			if user != "" {
 				ctx = ctxWithUser(user)
 			}
-			allowed, drillID, denyReason, err := drillActiveOperatorGate(ctx, c, self)
+			allowed, drillID, denyReason, err := callGate(ctx, c, self)
 			require.NoError(t, err)
 			require.True(t, allowed, "no-drill: gate must allow any user")
 			require.Empty(t, drillID)
@@ -131,7 +139,7 @@ func TestDrillActiveGate_DrillNoScope_AllowAnyone(t *testing.T) {
 	self := newStream("unrelated-stream", "UNRELATED", nil)
 
 	ctx := ctxWithUser("system:serviceaccount:argocd:argocd-application-controller")
-	allowed, drillID, denyReason, err := drillActiveOperatorGate(ctx, c, self)
+	allowed, drillID, denyReason, err := callGate(ctx, c, self)
 	require.NoError(t, err)
 	require.True(t, allowed, "drill-active but CR not scope-labeled: gate must allow")
 	require.Equal(t, "drill-2026-05-29-abc", drillID)
@@ -146,7 +154,7 @@ func TestDrillActiveGate_DrillScopeOperator_Allow(t *testing.T) {
 	self := scopedStream("orders-primary", "ORDERS")
 	ctx := ctxWithUser(DRPOperatorServiceAccount)
 
-	allowed, drillID, denyReason, err := drillActiveOperatorGate(ctx, c, self)
+	allowed, drillID, denyReason, err := callGate(ctx, c, self)
 	require.NoError(t, err)
 	require.True(t, allowed, "drill+scope+operator: gate must allow")
 	require.Equal(t, "drill-2026-05-29-abc", drillID)
@@ -169,7 +177,7 @@ func TestDrillActiveGate_DrillScopeOther_Reject(t *testing.T) {
 	} {
 		t.Run("user="+user, func(t *testing.T) {
 			ctx := ctxWithUser(user)
-			allowed, drillID, denyReason, err := drillActiveOperatorGate(ctx, c, self)
+			allowed, drillID, denyReason, err := callGate(ctx, c, self)
 			require.NoError(t, err)
 			require.False(t, allowed, "drill+scope+non-operator: gate must REJECT")
 			require.Equal(t, "drill-2026-05-29-abc", drillID)
@@ -178,6 +186,184 @@ func TestDrillActiveGate_DrillScopeOther_Reject(t *testing.T) {
 			require.Contains(t, denyReason, "drill-active=")
 		})
 	}
+}
+
+// TestDrillActiveGate_LiteralFalseAnnotation pins the gate's reading of the
+// drill-active annotation: today's contract treats ANY non-empty value as
+// "drill in flight" (the value is the drillID for audit). The literal
+// string "false" is therefore NOT an off-switch — it's a value, and the
+// gate fires. Operators that want to disable the gate must REMOVE the
+// annotation, not set it to "false". This test pins that semantics so a
+// future "false means false" change is intentional and tripwired here.
+//
+// Rationale for the pin: leaving "false"/"0"/"no" handling unspecified
+// would let two opposite mental models coexist (annotation-as-flag vs
+// annotation-as-drillID). We pick annotation-as-drillID because the
+// canonical drp-operator code path always writes the drillID, never a
+// boolean. The webhook gate must match.
+func TestDrillActiveGate_LiteralFalseAnnotation(t *testing.T) {
+	// Annotation present with literal "false" — still treated as drill
+	// in flight per the annotation-as-drillID contract.
+	c := newFakeClient(t, newNamespace(testNS, "false"))
+	self := scopedStream("orders-primary", "ORDERS")
+
+	t.Run("operator-allowed-as-usual", func(t *testing.T) {
+		ctx := ctxWithUser(DRPOperatorServiceAccount)
+		allowed, drillID, _, err := callGate(ctx, c, self)
+		require.NoError(t, err)
+		require.True(t, allowed, "operator SA passes regardless of drill annotation value")
+		require.Equal(t, "false", drillID, "annotation value is surfaced verbatim as drillID")
+	})
+
+	t.Run("non-operator-rejected-because-annotation-is-non-empty", func(t *testing.T) {
+		ctx := ctxWithUser("system:serviceaccount:argocd:argocd-application-controller")
+		allowed, _, denyReason, err := callGate(ctx, c, self)
+		require.NoError(t, err)
+		require.False(t, allowed,
+			"literal 'false' is a value, not an off-switch — gate must fire (remove annotation to disable)")
+		require.Contains(t, denyReason, "drill-active=\"false\"",
+			"denyReason carries the literal annotation value for triage")
+	})
+}
+
+// TestDrillActiveGate_ConfiguredOperatorSA exercises the flag-driven
+// override path: a prod-style deployment may run drp-operator under a
+// different namespace/SA pair, so the gate must compare against the
+// configured value, NOT the hardcoded dev/stg default.
+//
+// Two assertions in one test (a deliberate pairing):
+//
+//  1. The configured prod-style SA is accepted by the gate.
+//  2. The dev/stg default SA is REJECTED when the operator binary was
+//     started with the prod override (configuration drift between the
+//     operator's actual identity and the webhook's expectation is a
+//     hard-failure, not a silent allow).
+func TestDrillActiveGate_ConfiguredOperatorSA(t *testing.T) {
+	const prodOperatorSA = "system:serviceaccount:nats-prod:drp-operator-prod"
+
+	c := newFakeClient(t, newNamespace(testNS, "drill-prod-2026-06-01"))
+	self := scopedStream("orders-primary", "ORDERS")
+
+	t.Run("configured-SA-allowed", func(t *testing.T) {
+		ctx := ctxWithUser(prodOperatorSA)
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA)
+		require.NoError(t, err)
+		require.True(t, allowed, "configured operator SA must be allowed")
+	})
+
+	t.Run("dev-default-SA-rejected-under-prod-config", func(t *testing.T) {
+		ctx := ctxWithUser(DefaultDRPOperatorServiceAccount)
+		allowed, _, denyReason, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA)
+		require.NoError(t, err)
+		require.False(t, allowed,
+			"dev-default SA must NOT be silently accepted when prod SA is configured")
+		require.Contains(t, denyReason, DefaultDRPOperatorServiceAccount)
+	})
+
+	t.Run("empty-operatorSA-falls-back-to-default", func(t *testing.T) {
+		// Belt-and-suspenders: passing "" through the gate falls back
+		// to DefaultDRPOperatorServiceAccount so a missing flag wire-up
+		// doesn't open the gate to everyone.
+		ctx := ctxWithUser(DefaultDRPOperatorServiceAccount)
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, "")
+		require.NoError(t, err)
+		require.True(t, allowed, "empty configured SA must fall back to the default — not allow everyone")
+	})
+}
+
+// --- ValidateDelete matrix ---------------------------------------------
+//
+// ArgoCD prune on a scope-labeled CR mid-drill MUST be rejected. The 4
+// rows below mirror the CREATE/UPDATE decision matrix, scoped to DELETE.
+
+// TestDrillActiveGate_NoDrill_DeleteAllowsAnyone — row 1 of the matrix
+// applied to DELETE. Outside a drill, any deleter passes (kubectl, Argo,
+// operator).
+func TestDrillActiveGate_NoDrill_DeleteAllowsAnyone(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, ""))
+	v := &StreamValidator{Client: c}
+	self := scopedStream("orders-primary", "ORDERS")
+	for _, user := range []string{
+		DRPOperatorServiceAccount,
+		"system:serviceaccount:argocd:argocd-application-controller",
+		"developer@example.com",
+	} {
+		t.Run("user="+user, func(t *testing.T) {
+			ctx := ctxWithUser(user)
+			_, err := v.ValidateDelete(ctx, self)
+			require.NoError(t, err, "no-drill DELETE must be allowed for any user")
+		})
+	}
+}
+
+// TestDrillActiveGate_DrillNoScope_DeleteAllowsAnyone — row 2: drill is
+// active but the CR isn't scope-labeled, so the gate is a no-op and any
+// deleter passes through.
+func TestDrillActiveGate_DrillNoScope_DeleteAllowsAnyone(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-29-abc"))
+	v := &StreamValidator{Client: c}
+	// Unscoped Stream.
+	self := newStream("unrelated-stream", "UNRELATED", nil)
+
+	ctx := ctxWithUser("system:serviceaccount:argocd:argocd-application-controller")
+	_, err := v.ValidateDelete(ctx, self)
+	require.NoError(t, err, "drill-active but unscoped CR: DELETE must be allowed for non-operator")
+}
+
+// TestDrillActiveGate_DrillScopeOperator_DeleteAllows — row 3: the happy
+// path that PromotingDestination / DemotingSource subphases rely on. The
+// operator's delete (which is half of its delete+create promote cycle)
+// must always succeed.
+func TestDrillActiveGate_DrillScopeOperator_DeleteAllows(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-29-abc"))
+	v := &StreamValidator{Client: c}
+	self := scopedStream("orders-primary", "ORDERS")
+
+	ctx := ctxWithUser(DRPOperatorServiceAccount)
+	_, err := v.ValidateDelete(ctx, self)
+	require.NoError(t, err, "operator SA DELETE on scope-labeled CR must be allowed (promote delete+create needs this)")
+}
+
+// TestDrillActiveGate_DrillScopeOther_DeleteRejects — row 4: ArgoCD's
+// prune of a scope-labeled CR mid-drill is the exact failure mode the
+// original 2026-05-29 incident triggered ("3 NotFound — chart re-deleted
+// the CR after the operator's delete"). The DELETE gate closes this hole.
+func TestDrillActiveGate_DrillScopeOther_DeleteRejects(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-29-abc"))
+	v := &StreamValidator{Client: c}
+	self := scopedStream("orders-primary", "ORDERS")
+
+	argoUser := "system:serviceaccount:argocd:argocd-application-controller"
+	ctx := ctxWithUser(argoUser)
+	_, err := v.ValidateDelete(ctx, self)
+	require.Error(t, err, "ArgoCD prune on scope-labeled CR mid-drill must be rejected")
+	require.Contains(t, err.Error(), "drill-active operator-only gate")
+	require.Contains(t, err.Error(), argoUser)
+}
+
+// TestKeyValueValidator_DrillScopeOther_DeleteRejects — same shape for
+// KeyValue CRs. The KV chart also runs through ArgoCD; same rejection.
+func TestKeyValueValidator_DrillScopeOther_DeleteRejects(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-29-abc"))
+	v := &KeyValueValidator{Client: c}
+	self := scopedKV("config-primary", "CONFIG")
+
+	ctx := ctxWithUser("system:serviceaccount:argocd:argocd-application-controller")
+	_, err := v.ValidateDelete(ctx, self)
+	require.Error(t, err, "ArgoCD prune on scope-labeled KV mid-drill must be rejected")
+	require.Contains(t, err.Error(), "drill-active operator-only gate")
+}
+
+// TestKeyValueValidator_DrillScopeOperator_DeleteAllows — KV operator
+// happy path. Mirrors the Stream test.
+func TestKeyValueValidator_DrillScopeOperator_DeleteAllows(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-29-abc"))
+	v := &KeyValueValidator{Client: c}
+	self := scopedKV("config-primary", "CONFIG")
+
+	ctx := ctxWithUser(DRPOperatorServiceAccount)
+	_, err := v.ValidateDelete(ctx, self)
+	require.NoError(t, err)
 }
 
 // --- structural / drift guards -----------------------------------------

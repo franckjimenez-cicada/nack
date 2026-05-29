@@ -91,9 +91,10 @@ import (
 // future label-value evolution.
 const ScopeLabel = "drp.cicada.io/nats-failover-scope"
 
-// DRPOperatorServiceAccount is the canonical Kubernetes ServiceAccount the
-// drp-operator runs as. Format matches admission.Request.UserInfo.Username
-// for in-cluster ServiceAccount requests: `system:serviceaccount:<ns>:<sa>`.
+// DefaultDRPOperatorServiceAccount is the canonical Kubernetes ServiceAccount
+// the drp-operator runs as in dev/stg. Format matches
+// admission.Request.UserInfo.Username for in-cluster ServiceAccount requests:
+// `system:serviceaccount:<ns>:<sa>`.
 //
 // Values:
 //
@@ -103,11 +104,22 @@ const ScopeLabel = "drp.cicada.io/nats-failover-scope"
 //     chart/values.yaml `serviceAccount.name: drp-operator`.
 //
 // Confirmed by inspecting drp-operator@770c84a (main) chart/values.yaml.
-// If the operator's deployment namespace or SA name ever change, this
-// constant must be updated in lock-step or the gate will reject the
-// operator itself, breaking every drill cluster-wide. The webhook unit
-// tests pin the value so a drift is caught at build time.
-const DRPOperatorServiceAccount = "system:serviceaccount:nats:drp-operator"
+// Prod (and future) environments may pin a different namespace/SA — for
+// those, override at boot via the `--drp-operator-sa` flag on the
+// jetstream-controller binary. The constant remains the default value the
+// flag falls back to when unset.
+//
+// If the operator's deployment namespace or SA name ever change cluster-
+// wide, either update this constant in lock-step OR set the flag — either
+// way the validator's configured SA must match the AdmissionReview's
+// `userInfo.username` for the operator's own writes to pass the gate.
+const DefaultDRPOperatorServiceAccount = "system:serviceaccount:nats:drp-operator"
+
+// DRPOperatorServiceAccount is the legacy export — kept as a const alias to
+// DefaultDRPOperatorServiceAccount so external callers (tests, drp-operator
+// integration) keep compiling against a stable name. New code should read
+// the per-validator configured field rather than this package-level value.
+const DRPOperatorServiceAccount = DefaultDRPOperatorServiceAccount
 
 // operatorOnlyRemediationHint is the message tail returned alongside every
 // operator-only rejection. The first sentence names the rule; the second
@@ -141,6 +153,13 @@ type objectLabels interface {
 //   - err signals a webhook infrastructure failure (failed to read the
 //     Namespace object). Per failurePolicy=Fail, the apiserver rejects.
 //
+// `operatorSA` is the configured ServiceAccount username allowed to mutate
+// scope-labeled CRs during a drill. Pass DefaultDRPOperatorServiceAccount
+// (or whatever value the operator chart actually deploys with in this
+// cluster — for prod this may differ from dev). When empty, the gate
+// substitutes DefaultDRPOperatorServiceAccount so callers that haven't yet
+// migrated to the flag don't accidentally allow EVERYONE through.
+//
 // Decision matrix (in order — first match wins):
 //
 //	| drill-active | scope-labeled | requester  | result   |
@@ -156,7 +175,10 @@ type objectLabels interface {
 // (unit-test path), we treat the requester as the operator — tests that
 // want to exercise the rejection path set up the request explicitly via
 // admission.NewContextWithRequest.
-func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objectLabels) (allowed bool, drillID, denyReason string, err error) {
+func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objectLabels, operatorSA string) (allowed bool, drillID, denyReason string, err error) {
+	if operatorSA == "" {
+		operatorSA = DefaultDRPOperatorServiceAccount
+	}
 	// Step 1: namespace drill-active? Cheap to check first because the
 	// vast majority of admission calls outside drill windows skip the
 	// gate entirely. Reuses the existing drillActive() helper from
@@ -189,7 +211,7 @@ func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objec
 		// existing tests that pre-date the gate keep passing.
 		return true, id, "", nil
 	}
-	if username == DRPOperatorServiceAccount {
+	if username == operatorSA {
 		return true, id, "", nil
 	}
 
@@ -201,6 +223,15 @@ func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objec
 // require the value to be literal "true" — any non-empty value is treated
 // as in-scope, matching the conservative read the operator uses on its
 // side (the value is the audit/diagnostic trail; presence is the gate).
+//
+// Cross-repo contract note: today's drp-operator stamps `=true` on every
+// scope-labeled CR. This function intentionally matches `=true` semantics
+// PLUS any other non-empty value, so a future operator-side evolution to
+// (e.g.) `=v2` or `=scope-id-xyz` would still be honored by this gate
+// without a coordinated webhook bump. If the operator ever changes the
+// scope-label key (not value) — i.e. renames `nats-failover-scope` to
+// something else — BOTH sides must update together; that key is pinned by
+// the `ScopeLabel` constant above and (TBD) a cross-repo contract test.
 func isScopeLabeled(labels map[string]string) bool {
 	if labels == nil {
 		return false

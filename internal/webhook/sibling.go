@@ -219,6 +219,11 @@ func rejectionError(gvk schema.GroupVersionKind, self, sibling, reason string) e
 // StreamValidator implements admission.Validator for Stream CRs.
 type StreamValidator struct {
 	Client ctrlclient.Client
+	// DRPOperatorSA is the ServiceAccount username allowed to mutate
+	// scope-labeled CRs while a drill is active in the namespace. Empty
+	// falls back to DefaultDRPOperatorServiceAccount via the gate. Wired
+	// at boot from the --drp-operator-sa flag in cmd/jetstream-controller.
+	DRPOperatorSA string
 }
 
 var _ admission.Validator[*api.Stream] = &StreamValidator{}
@@ -231,7 +236,21 @@ func (v *StreamValidator) ValidateUpdate(ctx context.Context, _ *api.Stream, obj
 	return v.validate(ctx, obj)
 }
 
-func (v *StreamValidator) ValidateDelete(_ context.Context, _ *api.Stream) (admission.Warnings, error) {
+// ValidateDelete applies the operator-only gate on DELETE so ArgoCD's
+// prune on a scope-labeled CR mid-drill is rejected the same way an
+// UPDATE/CREATE would be. Operator-driven deletes (its PromotingDestination
+// + DemotingSource subphases delete CRs as part of their delete+create
+// cycle) come through the operator SA and pass the gate.
+//
+// Outside a drill / on a non-scope-labeled CR / when the requester IS the
+// operator SA, the gate is a no-op and delete proceeds — preserving the
+// upstream "no-op delete validator" behavior for the common case.
+func (v *StreamValidator) ValidateDelete(ctx context.Context, obj *api.Stream) (admission.Warnings, error) {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+		return nil, err
+	} else if !allowed {
+		return nil, formatOperatorOnlyRejection("Stream", obj.Name, denyReason)
+	}
 	return nil, nil
 }
 
@@ -240,7 +259,7 @@ func (v *StreamValidator) validate(ctx context.Context, obj *api.Stream) (admiss
 	// Runs FIRST so a denied request never burns the sibling-list cost.
 	// See drill_active_gate.go's header for the full rationale (live failure
 	// 2026-05-29 on the E→W flip; 7/17 streams failed promote).
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("Stream", obj.Name, denyReason)
@@ -277,6 +296,8 @@ func (v *StreamValidator) validate(ctx context.Context, obj *api.Stream) (admiss
 // KeyValueValidator implements admission.Validator for KeyValue CRs.
 type KeyValueValidator struct {
 	Client ctrlclient.Client
+	// DRPOperatorSA — see StreamValidator.DRPOperatorSA. Same semantics.
+	DRPOperatorSA string
 }
 
 var _ admission.Validator[*api.KeyValue] = &KeyValueValidator{}
@@ -289,14 +310,21 @@ func (v *KeyValueValidator) ValidateUpdate(ctx context.Context, _ *api.KeyValue,
 	return v.validate(ctx, obj)
 }
 
-func (v *KeyValueValidator) ValidateDelete(_ context.Context, _ *api.KeyValue) (admission.Warnings, error) {
+// ValidateDelete applies the operator-only gate on DELETE — see
+// StreamValidator.ValidateDelete for the rationale.
+func (v *KeyValueValidator) ValidateDelete(ctx context.Context, obj *api.KeyValue) (admission.Warnings, error) {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+		return nil, err
+	} else if !allowed {
+		return nil, formatOperatorOnlyRejection("KeyValue", obj.Name, denyReason)
+	}
 	return nil, nil
 }
 
 func (v *KeyValueValidator) validate(ctx context.Context, obj *api.KeyValue) (admission.Warnings, error) {
 	// Step 1: operator-only gate — same rationale as StreamValidator. See
 	// drill_active_gate.go header for the live failure context.
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("KeyValue", obj.Name, denyReason)
