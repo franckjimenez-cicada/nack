@@ -236,6 +236,20 @@ func (v *StreamValidator) ValidateDelete(_ context.Context, _ *api.Stream) (admi
 }
 
 func (v *StreamValidator) validate(ctx context.Context, obj *api.Stream) (admission.Warnings, error) {
+	// Step 1: operator-only gate (drill-active + scope-labeled + non-operator → REJECT).
+	// Runs FIRST so a denied request never burns the sibling-list cost.
+	// See drill_active_gate.go's header for the full rationale (live failure
+	// 2026-05-29 on the E→W flip; 7/17 streams failed promote).
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj); err != nil {
+		return nil, err
+	} else if !allowed {
+		return nil, formatOperatorOnlyRejection("Stream", obj.Name, denyReason)
+	}
+
+	// Step 2: legacy sibling-conflict check. Unchanged behavior — the
+	// operator-only gate fires only inside drill windows on scope-labeled
+	// CRs; everything else (chart steady-state, manual kubectl outside a
+	// drill, drill-active without scope label) falls through here.
 	sibling, reason, err := findStreamConflict(ctx, v.Client, obj)
 	if err != nil {
 		return nil, err
@@ -280,6 +294,15 @@ func (v *KeyValueValidator) ValidateDelete(_ context.Context, _ *api.KeyValue) (
 }
 
 func (v *KeyValueValidator) validate(ctx context.Context, obj *api.KeyValue) (admission.Warnings, error) {
+	// Step 1: operator-only gate — same rationale as StreamValidator. See
+	// drill_active_gate.go header for the live failure context.
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj); err != nil {
+		return nil, err
+	} else if !allowed {
+		return nil, formatOperatorOnlyRejection("KeyValue", obj.Name, denyReason)
+	}
+
+	// Step 2: legacy sibling-conflict check.
 	sibling, reason, err := findKeyValueConflict(ctx, v.Client, obj)
 	if err != nil {
 		return nil, err
