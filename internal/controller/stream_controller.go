@@ -188,6 +188,35 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	var gated bool
 	var gatedReason, gatedMessage string
 
+	// Evaluate passive-role translation BEFORE touching NATS so the
+	// rest of the reconcile (server state probe, mirror-flip detection,
+	// backup gate, UpdateConfiguration) all see the same "effective"
+	// spec. The original stream object is left untouched — translation
+	// is server-side only, so ArgoCD continues to see the chart's
+	// primary form on the CR and stays Synced/Healthy.
+	translatePassive, translateErr := shouldTranslatePassiveRole(ctx, r.JetStreamController, stream.Namespace)
+	if translateErr != nil {
+		// Reading the namespace failed (network blip / RBAC gap). Surface
+		// as a reconcile error rather than silently treating as active —
+		// silent fallthrough could destructively recreate a stream we
+		// were meant to keep mirroring.
+		stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, translateErr.Error())
+		if err := r.Status().Update(ctx, stream); err != nil {
+			log.Error(err, "Failed to update ready condition to Errored.")
+		}
+		return translateErr
+	}
+	effectiveSpec := &stream.Spec
+	if translatePassive {
+		translated := translateStreamSpecToMirror(&stream.Spec, r.CrossRegionNATSDomain())
+		effectiveSpec = &translated
+		log.Info("Passive-role translation active: applying mirror config to NATS server (K8s CR untouched).",
+			"localRole", localRolePassive,
+			"remoteDomain", r.CrossRegionNATSDomain(),
+			"streamName", stream.Spec.Name,
+		)
+	}
+
 	// CreateOrUpdateStream is called on every reconciliation when the stream is not to be deleted.
 	err := r.WithJSMClient(stream.Spec.ConnectionOpts, stream.Namespace, func(js *jsm.Manager) error {
 		storedState, err := getStoredStreamState(stream)
@@ -200,8 +229,9 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			return err
 		}
 
-		// Map spec to stream targetConfig, passing current server state for context
-		targetConfig, err := streamSpecToConfig(&stream.Spec, serverState)
+		// Map effective spec (possibly translated) to stream targetConfig,
+		// passing current server state for context.
+		targetConfig, err := streamSpecToConfig(effectiveSpec, serverState)
 		if err != nil {
 			return fmt.Errorf("map spec to stream targetConfig: %w", err)
 		}
@@ -220,7 +250,12 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// already holding this stream's data, or (b) an external operator
 		// confirming a backup via the configured annotation. See
 		// streamBackupGate below for the full predicate.
-		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, &stream.Spec) {
+		// Pass the EFFECTIVE spec (possibly translated to mirror form) into
+		// the flip detector so that, under passive-role translation, the
+		// "old server is primary, new spec is mirror" path is recognized
+		// and the destructive recreate runs against the synthesized mirror
+		// — not the chart's primary form.
+		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, effectiveSpec) {
 			gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 			if gateErr != nil {
 				return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -235,8 +270,9 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				return nil
 			}
 			log.Info("Source<->mirror flip detected; force-recreating Stream.",
-				"specHasMirror", stream.Spec.Mirror != nil,
+				"specHasMirror", effectiveSpec.Mirror != nil,
 				"serverHasMirror", serverState.Mirror != nil,
+				"translated", translatePassive,
 			)
 			if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
 				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
@@ -374,6 +410,19 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// raised on a prior reconcile — the destructive recreate either
 	// completed or was never needed this pass.
 	stream.Status.Conditions = removeBackupRequiredCondition(stream.Status.Conditions)
+
+	// Surface the passive-role translation outcome as a separate
+	// condition so operators can audit what got applied to NATS without
+	// inspecting the server. Cleared when translation did NOT fire.
+	if translatePassive {
+		stream.Status.Conditions = updatePassiveRoleTranslatedCondition(
+			stream.Status.Conditions, v1.ConditionTrue,
+			"PassiveRole",
+			fmt.Sprintf("Translated to mirror from $JS.%s.API", r.CrossRegionNATSDomain()),
+		)
+	} else {
+		stream.Status.Conditions = removePassiveRoleTranslatedCondition(stream.Status.Conditions)
+	}
 
 	// update the observed generation and ready status
 	stream.Status.ObservedGeneration = stream.Generation

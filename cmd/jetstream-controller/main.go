@@ -96,6 +96,10 @@ func run() error {
 	backupConfirmedAnnotation := flag.String("backup-confirmed-annotation", "drp.cicada.io/backup-confirmed-generation", "Annotation key the controller reads to know an external backup operator has captured the CR's local state. Value must equal the CR's metadata.generation as a decimal string.")
 	drpOperatorSA := flag.String("drp-operator-sa", webhook.DefaultDRPOperatorServiceAccount,
 		"ServiceAccount username (format `system:serviceaccount:<ns>:<sa>`) allowed to mutate scope-labeled Stream/KeyValue CRs while the namespace carries the drill-active annotation. Defaults to the dev/stg convention; override for prod or other environments where drp-operator runs under a different namespace/SA.")
+	enablePassiveRoleTranslation := flag.Bool("enable-passive-role-translation", false,
+		"Translate primary-form Stream/KeyValue CRs to mirror form when the namespace carries `drp.cicada.io/local-role=passive`. The K8s CR is NOT modified — translation only affects what is applied to the NATS server. Eliminates the ArgoCD selfHeal vs drp-operator race on the passive region post-flip. Requires --cross-region-nats-domain to be set; off by default.")
+	crossRegionNATSDomain := flag.String("cross-region-nats-domain", "",
+		"JetStream domain of the peer region (e.g. `dev-2nd-east` when running on dev-west). Used by --enable-passive-role-translation to synthesize `externalApiPrefix=$JS.<domain>.API` on the translated mirror config. Required for translation; ignored when --enable-passive-role-translation is off.")
 
 	flag.Parse()
 
@@ -132,20 +136,22 @@ func run() error {
 		}
 
 		controllerCfg := &controller.Config{
-			ReadOnly:                  *readOnly,
-			Namespace:                 *namespace,
-			CacheDir:                  *cacheDir,
-			RequeueInterval:           *controlLoopSyncInterval,
-			HealthProbeBindAddress:    *healthProbeBindAddress,
-			EnableSiblingWebhook:      *enableWebhook,
-			WebhookPort:               *webhookPort,
-			WebhookCertDir:            *webhookCertDir,
-			MirrorRecreateOnConflict:  *mirrorRecreateOnConflict,
-			RequireBackupConfirmation: *requireBackupConfirmation,
-			CrossRegionNATSURL:        *crossRegionNATSURL,
-			CrossRegionNATSCredsPath:  *crossRegionNATSCredsPath,
-			BackupConfirmedAnnotation: *backupConfirmedAnnotation,
-			DRPOperatorSA:             *drpOperatorSA,
+			ReadOnly:                     *readOnly,
+			Namespace:                    *namespace,
+			CacheDir:                     *cacheDir,
+			RequeueInterval:              *controlLoopSyncInterval,
+			HealthProbeBindAddress:       *healthProbeBindAddress,
+			EnableSiblingWebhook:         *enableWebhook,
+			WebhookPort:                  *webhookPort,
+			WebhookCertDir:               *webhookCertDir,
+			MirrorRecreateOnConflict:     *mirrorRecreateOnConflict,
+			RequireBackupConfirmation:    *requireBackupConfirmation,
+			CrossRegionNATSURL:           *crossRegionNATSURL,
+			CrossRegionNATSCredsPath:     *crossRegionNATSCredsPath,
+			BackupConfirmedAnnotation:    *backupConfirmedAnnotation,
+			DRPOperatorSA:                *drpOperatorSA,
+			EnablePassiveRoleTranslation: *enablePassiveRoleTranslation,
+			CrossRegionNATSDomain:        *crossRegionNATSDomain,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)
