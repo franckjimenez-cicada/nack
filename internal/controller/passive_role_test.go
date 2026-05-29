@@ -25,15 +25,20 @@ import (
 
 func TestTranslateStreamSpecToMirror(t *testing.T) {
 	orig := &api.StreamSpec{
-		Name:     "activitylog",
-		Subjects: []string{"cobactions", "activitylog.start", "activitylog.end"},
+		Name:      "activitylog",
+		Subjects:  []string{"cobactions", "activitylog.start", "activitylog.end"},
 		Retention: "limits",
 		Replicas:  3,
+		Sources:   []*api.StreamSource{{Name: "upstream"}},
+		Placement: &api.StreamPlacement{Cluster: "west-1", Tags: []string{"a", "b"}},
 	}
 	got := translateStreamSpecToMirror(orig, "dev-2nd-east")
 
 	if got.Subjects != nil {
 		t.Errorf("Subjects should be cleared, got %v", got.Subjects)
+	}
+	if got.Sources != nil {
+		t.Errorf("Sources should be cleared, got %v", got.Sources)
 	}
 	if got.Mirror == nil {
 		t.Fatal("Mirror should be set")
@@ -54,6 +59,9 @@ func TestTranslateStreamSpecToMirror(t *testing.T) {
 	if len(orig.Subjects) != 3 {
 		t.Errorf("Original Subjects was mutated: %v", orig.Subjects)
 	}
+	if len(orig.Sources) != 1 {
+		t.Errorf("Original Sources was mutated: %v", orig.Sources)
+	}
 	if orig.Mirror != nil {
 		t.Errorf("Original Mirror was mutated: %v", orig.Mirror)
 	}
@@ -63,6 +71,20 @@ func TestTranslateStreamSpecToMirror(t *testing.T) {
 	// don't strip aggressively — keeping them simplifies revert.
 	if got.Replicas != 3 {
 		t.Errorf("Replicas should be preserved, got %d", got.Replicas)
+	}
+
+	// DeepCopy guards against pointer aliasing: mutating got.Placement
+	// must NOT corrupt orig.Placement.
+	if got.Placement == nil {
+		t.Fatal("Placement should be carried over (deep-copied)")
+	}
+	got.Placement.Cluster = "MUTATED"
+	got.Placement.Tags[0] = "MUTATED"
+	if orig.Placement.Cluster != "west-1" {
+		t.Errorf("Original Placement.Cluster aliased — translation MUST DeepCopy. Got %q.", orig.Placement.Cluster)
+	}
+	if orig.Placement.Tags[0] != "a" {
+		t.Errorf("Original Placement.Tags aliased — translation MUST DeepCopy. Got %q.", orig.Placement.Tags[0])
 	}
 }
 
@@ -123,68 +145,78 @@ func newFakeGate(t *testing.T, enabled bool, domain string, nsAnnotations map[st
 
 func TestShouldTranslatePassiveRole(t *testing.T) {
 	tests := []struct {
-		name      string
-		enabled   bool
-		domain    string
-		nsAnnots  map[string]string
-		want      bool
-		wantError bool
+		name         string
+		enabled      bool
+		domain       string
+		nsAnnots     map[string]string
+		wantTrans    bool
+		wantRole     string
+		wantError    bool
 	}{
 		{
-			name:     "feature disabled",
-			enabled:  false,
-			domain:   "dev-2nd-east",
-			nsAnnots: map[string]string{localRoleAnnotation: localRolePassive},
-			want:     false,
+			name:      "feature disabled but ns still passive — translate=false, role surfaces",
+			enabled:   false,
+			domain:    "dev-2nd-east",
+			nsAnnots:  map[string]string{localRoleAnnotation: localRolePassive},
+			wantTrans: false,
+			wantRole:  localRolePassive,
 		},
 		{
-			name:     "domain empty",
-			enabled:  true,
-			domain:   "",
-			nsAnnots: map[string]string{localRoleAnnotation: localRolePassive},
-			want:     false,
+			name:      "domain empty",
+			enabled:   true,
+			domain:    "",
+			nsAnnots:  map[string]string{localRoleAnnotation: localRolePassive},
+			wantTrans: false,
+			wantRole:  localRolePassive,
 		},
 		{
-			name:     "annotation absent",
-			enabled:  true,
-			domain:   "dev-2nd-east",
-			nsAnnots: nil,
-			want:     false,
+			name:      "annotation absent",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			nsAnnots:  nil,
+			wantTrans: false,
+			wantRole:  "",
 		},
 		{
-			name:     "annotation active",
-			enabled:  true,
-			domain:   "dev-2nd-east",
-			nsAnnots: map[string]string{localRoleAnnotation: "active"},
-			want:     false,
+			name:      "annotation active",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			nsAnnots:  map[string]string{localRoleAnnotation: "active"},
+			wantTrans: false,
+			wantRole:  "active",
 		},
 		{
-			name:     "annotation passive — all conditions met",
-			enabled:  true,
-			domain:   "dev-2nd-east",
-			nsAnnots: map[string]string{localRoleAnnotation: localRolePassive},
-			want:     true,
+			name:      "annotation passive — all conditions met",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			nsAnnots:  map[string]string{localRoleAnnotation: localRolePassive},
+			wantTrans: true,
+			wantRole:  localRolePassive,
 		},
 		{
-			name:     "annotation passive but other value casing",
-			enabled:  true,
-			domain:   "dev-2nd-east",
-			nsAnnots: map[string]string{localRoleAnnotation: "Passive"},
-			want:     false,
+			name:      "annotation passive but other value casing",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			nsAnnots:  map[string]string{localRoleAnnotation: "Passive"},
+			wantTrans: false,
+			wantRole:  "Passive",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			jsc := newFakeGate(t, tc.enabled, tc.domain, tc.nsAnnots)
-			got, err := shouldTranslatePassiveRole(context.Background(), jsc, "nats")
+			gotTrans, gotRole, err := shouldTranslatePassiveRole(context.Background(), jsc, "nats")
 			if tc.wantError && err == nil {
 				t.Fatalf("want error, got nil")
 			}
 			if !tc.wantError && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got != tc.want {
-				t.Errorf("got %v, want %v", got, tc.want)
+			if gotTrans != tc.wantTrans {
+				t.Errorf("translate = %v, want %v", gotTrans, tc.wantTrans)
+			}
+			if gotRole != tc.wantRole {
+				t.Errorf("localRole = %q, want %q", gotRole, tc.wantRole)
 			}
 		})
 	}
@@ -202,11 +234,30 @@ func TestShouldTranslatePassiveRole_NamespaceNotFound(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	jsc := &fakePassiveRoleGate{Client: c, enabled: true, domain: "dev-2nd-east"}
 
-	got, err := shouldTranslatePassiveRole(context.Background(), jsc, "missing-ns")
+	gotTrans, gotRole, err := shouldTranslatePassiveRole(context.Background(), jsc, "missing-ns")
 	if err != nil {
 		t.Fatalf("unexpected error on missing ns: %v", err)
 	}
-	if got {
-		t.Errorf("missing ns should yield false, got true")
+	if gotTrans {
+		t.Errorf("missing ns should yield translate=false, got true")
+	}
+	if gotRole != "" {
+		t.Errorf("missing ns should yield role=\"\", got %q", gotRole)
+	}
+}
+
+// TestReadLocalRole_DecoupledFromFeatureGate is the B1 invariant: the
+// destructive-recreate safety guard needs the role REGARDLESS of the
+// feature flag. readLocalRole must return the annotation value even when
+// translation itself would be skipped (flag off / domain empty).
+func TestReadLocalRole_DecoupledFromFeatureGate(t *testing.T) {
+	jsc := newFakeGate(t, /*enabled=*/ false, /*domain=*/ "",
+		map[string]string{localRoleAnnotation: localRolePassive})
+	got, err := readLocalRole(context.Background(), jsc, "nats")
+	if err != nil {
+		t.Fatalf("readLocalRole err: %v", err)
+	}
+	if got != localRolePassive {
+		t.Errorf("readLocalRole = %q, want %q (must surface role even with flag off — guards B1)", got, localRolePassive)
 	}
 }

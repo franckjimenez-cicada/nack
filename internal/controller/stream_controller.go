@@ -187,6 +187,13 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// whether to short-circuit the success-path Ready=True update.
 	var gated bool
 	var gatedReason, gatedMessage string
+	// passiveRoleGuardBlocked is set when the B1 safety guard fires:
+	// namespace says passive but the controller would otherwise demote a
+	// translated mirror back to primary (feature flag toggled off
+	// mid-life). Treated the same as `gated` — status surfaces Ready=False
+	// with a clear reason and the success path is skipped.
+	var passiveRoleGuardBlocked bool
+	var passiveRoleGuardMessage string
 
 	// Evaluate passive-role translation BEFORE touching NATS so the
 	// rest of the reconcile (server state probe, mirror-flip detection,
@@ -194,7 +201,12 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// spec. The original stream object is left untouched — translation
 	// is server-side only, so ArgoCD continues to see the chart's
 	// primary form on the CR and stays Synced/Healthy.
-	translatePassive, translateErr := shouldTranslatePassiveRole(ctx, r.JetStreamController, stream.Namespace)
+	//
+	// localRole is returned regardless of the feature gate so the
+	// downstream destructive-recreate guard can refuse to demote a
+	// translated mirror back to primary when the ns is still passive
+	// (B1: protects against operator toggling the feature flag off mid-life).
+	translatePassive, localRole, translateErr := shouldTranslatePassiveRole(ctx, r.JetStreamController, stream.Namespace)
 	if translateErr != nil {
 		// Reading the namespace failed (network blip / RBAC gap). Surface
 		// as a reconcile error rather than silently treating as active —
@@ -213,6 +225,7 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		log.Info("Passive-role translation active: applying mirror config to NATS server (K8s CR untouched).",
 			"localRole", localRolePassive,
 			"remoteDomain", r.CrossRegionNATSDomain(),
+			"namespace", stream.Namespace,
 			"streamName", stream.Spec.Name,
 		)
 	}
@@ -256,6 +269,26 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// and the destructive recreate runs against the synthesized mirror
 		// — not the chart's primary form.
 		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, effectiveSpec) {
+			// B1 safety guard: refuse the destructive recreate when the
+			// flip direction is mirror → primary AND the namespace is
+			// still annotated `local-role=passive`. The only realistic
+			// way to reach this branch is operator misconfig (feature
+			// flag toggled off while the ns annotation still says
+			// passive) — destroying the mirror would lose the in-flight
+			// replicated state and seed split-brain. Surface as
+			// non-Ready + a clear status reason and bail.
+			if serverState.Mirror != nil && effectiveSpec.Mirror == nil && localRole == localRolePassive {
+				passiveRoleGuardBlocked = true
+				passiveRoleGuardMessage = fmt.Sprintf(
+					"refusing mirror→primary destructive recreate: namespace %q has %s=%s but the controller is configured to apply primary form (translation enabled=%t, domain=%q). Set --enable-passive-role-translation + --cross-region-nats-domain, or clear the namespace annotation before continuing.",
+					stream.Namespace, localRoleAnnotation, localRolePassive,
+					r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain(),
+				)
+				log.Error(nil, "Passive-role safety guard fired; skipping destructive recreate.",
+					"namespace", stream.Namespace, "streamName", stream.Spec.Name,
+				)
+				return nil
+			}
 			gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 			if gateErr != nil {
 				return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -389,6 +422,34 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		return err
 	}
 
+	// Record the passive-role translation outcome FIRST so operators can
+	// audit what happened even on paths that short-circuit (backup gate
+	// blocked, passive-role guard blocked). Cleared when translation did
+	// NOT fire this pass.
+	if translatePassive {
+		stream.Status.Conditions = updatePassiveRoleTranslatedCondition(
+			stream.Status.Conditions, v1.ConditionTrue,
+			"PassiveRole",
+			fmt.Sprintf("Translated to mirror from $JS.%s.API", r.CrossRegionNATSDomain()),
+		)
+	} else {
+		stream.Status.Conditions = removePassiveRoleTranslatedCondition(stream.Status.Conditions)
+	}
+
+	if passiveRoleGuardBlocked {
+		// Mirror→primary destructive recreate refused because the ns is
+		// still passive. Do NOT bump observedGeneration — the next
+		// reconcile should re-evaluate once the operator clears the
+		// misconfig (flip the flag, or clear the annotation).
+		stream.Status.Conditions = updateReadyCondition(
+			stream.Status.Conditions, v1.ConditionFalse, stateErrored, passiveRoleGuardMessage,
+		)
+		if err := r.Status().Update(ctx, stream); err != nil {
+			return fmt.Errorf("update Ready=Errored after passive-role guard: %w", err)
+		}
+		return nil
+	}
+
 	if gated {
 		// The destructive recreate path was blocked by the backup gate.
 		// Surface that via the BackupRequired condition + a non-Ready
@@ -410,19 +471,6 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// raised on a prior reconcile — the destructive recreate either
 	// completed or was never needed this pass.
 	stream.Status.Conditions = removeBackupRequiredCondition(stream.Status.Conditions)
-
-	// Surface the passive-role translation outcome as a separate
-	// condition so operators can audit what got applied to NATS without
-	// inspecting the server. Cleared when translation did NOT fire.
-	if translatePassive {
-		stream.Status.Conditions = updatePassiveRoleTranslatedCondition(
-			stream.Status.Conditions, v1.ConditionTrue,
-			"PassiveRole",
-			fmt.Sprintf("Translated to mirror from $JS.%s.API", r.CrossRegionNATSDomain()),
-		)
-	} else {
-		stream.Status.Conditions = removePassiveRoleTranslatedCondition(stream.Status.Conditions)
-	}
 
 	// update the observed generation and ready status
 	stream.Status.ObservedGeneration = stream.Generation

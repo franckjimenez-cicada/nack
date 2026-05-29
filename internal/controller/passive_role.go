@@ -32,50 +32,76 @@ type passiveRoleGate interface {
 	CrossRegionNATSDomain() string
 }
 
-// shouldTranslatePassiveRole reports whether the reconciler should rewrite
-// the supplied CR's spec to mirror form before applying to NATS.
+// readLocalRole returns the value of `drp.cicada.io/local-role` on the
+// supplied namespace, or "" when the annotation is absent / the
+// namespace is missing. Decoupled from the feature flag — the role is
+// load-bearing for safety guards (B1: refuse mirror→primary destructive
+// recreate when ns is still passive but the feature flag was toggled
+// off mid-life) even when translation itself is disabled.
 //
-// The translation fires only when ALL of the following hold:
+// Errors other than NotFound bubble up so the caller can refuse to
+// proceed; silent fallthrough on a transient API error could
+// destructively recreate the very stream we were translating last
+// reconcile.
+func readLocalRole(ctx context.Context, g passiveRoleGate, namespace string) (string, error) {
+	ns := &corev1.Namespace{}
+	if err := g.Get(ctx, types.NamespacedName{Name: namespace}, ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read namespace %q to evaluate local-role: %w", namespace, err)
+	}
+	return ns.Annotations[localRoleAnnotation], nil
+}
+
+// shouldTranslatePassiveRole reports whether the reconciler should rewrite
+// the supplied CR's spec to mirror form before applying to NATS, plus
+// the current ns local-role value.
+//
+// Translation fires only when ALL of the following hold:
 //   - The controller has --enable-passive-role-translation set (feature gate).
 //   - --cross-region-nats-domain is non-empty (we need it to build the
 //     externalApiPrefix). Without it, translation would synthesize an
 //     invalid mirror config — better to skip and leave the CR as authored.
 //   - The CR's namespace carries `drp.cicada.io/local-role=passive`.
 //
-// On any error reading the namespace (network blip, RBAC gap), the
-// function returns (false, err) so the caller can decide whether to fail
-// the reconcile or fall through to non-translated behavior. The intent is
-// "safe default = no translation" — a failure to read the role MUST NOT
-// silently convert a primary stream to mirror.
-func shouldTranslatePassiveRole(ctx context.Context, g passiveRoleGate, namespace string) (bool, error) {
+// The returned localRole is the raw annotation value REGARDLESS of the
+// feature gate, so callers can detect the "ns is passive but flag is
+// off" misconfig and refuse destructive operations. On namespace read
+// error, returns (false, "", err) so the caller can fail the reconcile
+// rather than silently treat as active.
+func shouldTranslatePassiveRole(ctx context.Context, g passiveRoleGate, namespace string) (translate bool, localRole string, err error) {
+	role, err := readLocalRole(ctx, g, namespace)
+	if err != nil {
+		return false, "", err
+	}
 	if !g.PassiveRoleTranslationEnabled() {
-		return false, nil
+		return false, role, nil
 	}
 	if g.CrossRegionNATSDomain() == "" {
-		return false, nil
+		return false, role, nil
 	}
-
-	ns := &corev1.Namespace{}
-	if err := g.Get(ctx, types.NamespacedName{Name: namespace}, ns); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("read namespace %q to evaluate local-role: %w", namespace, err)
-	}
-
-	return ns.Annotations[localRoleAnnotation] == localRolePassive, nil
+	return role == localRolePassive, role, nil
 }
 
-// translateStreamSpecToMirror returns a copy of the supplied Stream spec
-// with Subjects cleared and Mirror set to a config that pulls from the
-// peer region's JetStream domain. The original spec (and therefore the
-// in-cluster CR) is left untouched.
+// translateStreamSpecToMirror returns a deep-copied Stream spec with
+// Subjects + Sources cleared and Mirror set to a config that pulls from
+// the peer region's JetStream domain. The original spec (and therefore
+// the in-cluster CR) is left untouched.
+//
+// Uses the generated DeepCopy so pointer fields (Placement,
+// SubjectTransform, RePublish, ConsumerLimits, Metadata map) are
+// genuinely independent — a shallow `*orig` copy would alias those into
+// the returned value, and a well-intentioned downstream mutation could
+// corrupt the live in-memory CR object. The translation contract
+// ("K8s CR is untouched, server-side only") MUST hold against such
+// future edits, not just today's careful caller.
 //
 // Caller is responsible for already having decided translation should
 // fire (see shouldTranslatePassiveRole) — this function performs the
 // transformation unconditionally on its inputs.
 func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.StreamSpec {
-	translated := *orig
+	translated := *orig.DeepCopy()
 	translated.Subjects = nil
 	translated.Sources = nil
 	streamName := orig.Name
@@ -92,8 +118,10 @@ func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.
 // mirror's Name field uses that convention. The deliver prefix follows
 // the chart's "deliver.kv.<bucket>.dr" pattern documented in
 // gitops-platform-dev-stg/children/nacks-streams-sync values.
+//
+// Uses DeepCopy for the same reason as translateStreamSpecToMirror.
 func translateKeyValueSpecToMirror(orig *api.KeyValueSpec, remoteDomain string) api.KeyValueSpec {
-	translated := *orig
+	translated := *orig.DeepCopy()
 	translated.Sources = nil
 	bucket := orig.Bucket
 	translated.Mirror = &api.StreamSource{
