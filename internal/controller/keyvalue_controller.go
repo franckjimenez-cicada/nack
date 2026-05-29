@@ -312,7 +312,9 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				// Reactive fallback: recreate the underlying KV stream when
 				// NATS rejects the update as mirror-incompatible.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
-					// B1 safety guard (reactive site) — see stream_controller.go.
+					// B1 safety guard (reactive site) — see stream_controller.go
+					// for full rationale, including the note on serverState
+					// staleness across the UpdateKeyValue boundary.
 					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
 						passiveRoleGuardBlocked = true
 						passiveRoleGuardMessage = passiveRoleGuardMsg(keyValue.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())

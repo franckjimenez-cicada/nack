@@ -106,6 +106,13 @@ func passiveRoleGuardMsg(namespace string, translationEnabled bool, domain strin
 // Both destructive-recreate sites (proactive flip detection AND reactive
 // fallback from a mirror-incompatible UpdateConfiguration error) must
 // gate on this predicate.
+//
+// The signature takes bools (rather than pointers to the Mirror fields)
+// because the two controllers carry distinct server-side Mirror types —
+// Stream uses *jsmapi.StreamSource (jsm.go) while KeyValue uses
+// *jetstream.StreamSource (nats.go/jetstream). Booleans unify the
+// presence test across both packages without dragging an interface
+// through the call signature.
 func passiveRoleWouldDemote(serverHasMirror, effectiveSpecHasMirror bool, localRole string) bool {
 	return serverHasMirror && !effectiveSpecHasMirror && localRole == localRolePassive
 }

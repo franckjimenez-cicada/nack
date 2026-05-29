@@ -357,6 +357,15 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 					// NATS's mirror-incompatible error tells us the
 					// effective-spec / server pair is mismatched. Refuse
 					// the reactive delete on the same condition.
+					//
+					// serverState here is the read from before
+					// UpdateConfiguration was attempted. A concurrent
+					// external mutation between read and update could
+					// stale this — but a misfire is recoverable: false
+					// negative falls through to streamBackupGate (which
+					// itself blocks destructive recreate); false positive
+					// just costs one extra Ready=Errored cycle before
+					// the next reconcile re-reads fresh state.
 					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
 						passiveRoleGuardBlocked = true
 						passiveRoleGuardMessage = passiveRoleGuardMsg(stream.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
