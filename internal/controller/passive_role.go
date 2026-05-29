@@ -84,6 +84,32 @@ func shouldTranslatePassiveRole(ctx context.Context, g passiveRoleGate, namespac
 	return role == localRolePassive, role, nil
 }
 
+// passiveRoleGuardMsg builds the operator-facing message attached to
+// Ready=Errored when the safety guard fires. Centralized so the
+// proactive + reactive sites in both controllers stay symmetric.
+func passiveRoleGuardMsg(namespace string, translationEnabled bool, domain string) string {
+	return fmt.Sprintf(
+		"refusing mirror→primary destructive recreate: namespace %q has %s=%s but the controller is configured to apply primary form (translation enabled=%t, domain=%q). Set --enable-passive-role-translation + --cross-region-nats-domain, or clear the namespace annotation before continuing.",
+		namespace, localRoleAnnotation, localRolePassive,
+		translationEnabled, domain,
+	)
+}
+
+// passiveRoleWouldDemote reports whether the current reconcile state
+// would, if it proceeded, destructively recreate a NATS-server mirror
+// stream back into primary form while the namespace is still annotated
+// `local-role=passive`. This is the B1 hazard: an operator who toggles
+// --enable-passive-role-translation off without first clearing the
+// annotation would otherwise see the controller demote every translated
+// mirror, losing in-flight replicated state and seeding split-brain.
+//
+// Both destructive-recreate sites (proactive flip detection AND reactive
+// fallback from a mirror-incompatible UpdateConfiguration error) must
+// gate on this predicate.
+func passiveRoleWouldDemote(serverHasMirror, effectiveSpecHasMirror bool, localRole string) bool {
+	return serverHasMirror && !effectiveSpecHasMirror && localRole == localRolePassive
+}
+
 // translateStreamSpecToMirror returns a deep-copied Stream spec with
 // Subjects + Sources cleared and Mirror set to a config that pulls from
 // the peer region's JetStream domain. The original spec (and therefore

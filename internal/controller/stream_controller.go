@@ -277,14 +277,10 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			// passive) — destroying the mirror would lose the in-flight
 			// replicated state and seed split-brain. Surface as
 			// non-Ready + a clear status reason and bail.
-			if serverState.Mirror != nil && effectiveSpec.Mirror == nil && localRole == localRolePassive {
+			if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
 				passiveRoleGuardBlocked = true
-				passiveRoleGuardMessage = fmt.Sprintf(
-					"refusing mirror→primary destructive recreate: namespace %q has %s=%s but the controller is configured to apply primary form (translation enabled=%t, domain=%q). Set --enable-passive-role-translation + --cross-region-nats-domain, or clear the namespace annotation before continuing.",
-					stream.Namespace, localRoleAnnotation, localRolePassive,
-					r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain(),
-				)
-				log.Error(nil, "Passive-role safety guard fired; skipping destructive recreate.",
+				passiveRoleGuardMessage = passiveRoleGuardMsg(stream.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+				log.Error(nil, "Passive-role safety guard fired; skipping proactive destructive recreate.",
 					"namespace", stream.Namespace, "streamName", stream.Spec.Name,
 				)
 				return nil
@@ -355,6 +351,20 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				// change requires source<->mirror flip, force-delete and
 				// re-create. Bounded to a single retry.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					// B1 safety guard (reactive site): the proactive
+					// branch's predicate did not fire (maybe serverState
+					// wasn't yet mirror at the proactive check), but
+					// NATS's mirror-incompatible error tells us the
+					// effective-spec / server pair is mismatched. Refuse
+					// the reactive delete on the same condition.
+					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+						passiveRoleGuardBlocked = true
+						passiveRoleGuardMessage = passiveRoleGuardMsg(stream.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+						log.Error(nil, "Passive-role safety guard fired; skipping reactive destructive recreate.",
+							"namespace", stream.Namespace, "streamName", stream.Spec.Name, "natsErr", err.Error(),
+						)
+						return nil
+					}
 					gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 					if gateErr != nil {
 						return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -413,19 +423,11 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 
 		return nil
 	})
-	if err != nil {
-		err = fmt.Errorf("create or update stream: %w", err)
-		stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
-		if err := r.Status().Update(ctx, stream); err != nil {
-			log.Error(err, "Failed to update ready condition to Errored.")
-		}
-		return err
-	}
-
-	// Record the passive-role translation outcome FIRST so operators can
-	// audit what happened even on paths that short-circuit (backup gate
-	// blocked, passive-role guard blocked). Cleared when translation did
-	// NOT fire this pass.
+	// Bake the PassiveRoleTranslated audit condition into the conditions
+	// slice BEFORE any branch writes Status — so the closure-err path,
+	// guard path, gate path, and success path all surface the same audit
+	// signal. The condition value reflects whether translation was
+	// ATTEMPTED this pass, not whether downstream NATS calls succeeded.
 	if translatePassive {
 		stream.Status.Conditions = updatePassiveRoleTranslatedCondition(
 			stream.Status.Conditions, v1.ConditionTrue,
@@ -434,6 +436,15 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		)
 	} else {
 		stream.Status.Conditions = removePassiveRoleTranslatedCondition(stream.Status.Conditions)
+	}
+
+	if err != nil {
+		err = fmt.Errorf("create or update stream: %w", err)
+		stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
+		if err := r.Status().Update(ctx, stream); err != nil {
+			log.Error(err, "Failed to update ready condition to Errored.")
+		}
+		return err
 	}
 
 	if passiveRoleGuardBlocked {

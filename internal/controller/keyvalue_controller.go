@@ -244,14 +244,10 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		// when the server still holds a primary KV stream.
 		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, effectiveSpec) {
 			// B1 safety guard — see stream_controller.go for rationale.
-			if serverState.Mirror != nil && effectiveSpec.Mirror == nil && localRole == localRolePassive {
+			if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
 				passiveRoleGuardBlocked = true
-				passiveRoleGuardMessage = fmt.Sprintf(
-					"refusing mirror→primary destructive recreate: namespace %q has %s=%s but the controller is configured to apply primary form (translation enabled=%t, domain=%q). Set --enable-passive-role-translation + --cross-region-nats-domain, or clear the namespace annotation before continuing.",
-					keyValue.Namespace, localRoleAnnotation, localRolePassive,
-					r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain(),
-				)
-				log.Error(nil, "Passive-role safety guard fired; skipping destructive recreate.",
+				passiveRoleGuardMessage = passiveRoleGuardMsg(keyValue.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+				log.Error(nil, "Passive-role safety guard fired; skipping proactive destructive recreate.",
 					"namespace", keyValue.Namespace, "bucket", keyValue.Spec.Bucket,
 				)
 				return nil
@@ -316,6 +312,15 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				// Reactive fallback: recreate the underlying KV stream when
 				// NATS rejects the update as mirror-incompatible.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					// B1 safety guard (reactive site) — see stream_controller.go.
+					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+						passiveRoleGuardBlocked = true
+						passiveRoleGuardMessage = passiveRoleGuardMsg(keyValue.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+						log.Error(nil, "Passive-role safety guard fired; skipping reactive destructive recreate.",
+							"namespace", keyValue.Namespace, "bucket", keyValue.Spec.Bucket, "natsErr", err.Error(),
+						)
+						return nil
+					}
 					gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
 					if gateErr != nil {
 						return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -379,18 +384,8 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 
 		return nil
 	})
-	if err != nil {
-		err = fmt.Errorf("create or update keyvalue: %w", err)
-		keyValue.Status.Conditions = updateReadyCondition(keyValue.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
-		if err := r.Status().Update(ctx, keyValue); err != nil {
-			log.Error(err, "Failed to update ready condition to Errored.")
-		}
-		return err
-	}
-
-	// Surface passive-role translation outcome FIRST so operators can
-	// audit on all short-circuit paths. See stream_controller.go for
-	// the symmetric block + rationale.
+	// Bake the PassiveRoleTranslated audit condition BEFORE any branch
+	// writes Status — see stream_controller.go for rationale.
 	if translatePassive {
 		keyValue.Status.Conditions = updatePassiveRoleTranslatedCondition(
 			keyValue.Status.Conditions, v1.ConditionTrue,
@@ -399,6 +394,15 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		)
 	} else {
 		keyValue.Status.Conditions = removePassiveRoleTranslatedCondition(keyValue.Status.Conditions)
+	}
+
+	if err != nil {
+		err = fmt.Errorf("create or update keyvalue: %w", err)
+		keyValue.Status.Conditions = updateReadyCondition(keyValue.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
+		if err := r.Status().Update(ctx, keyValue); err != nil {
+			log.Error(err, "Failed to update ready condition to Errored.")
+		}
+		return err
 	}
 
 	if passiveRoleGuardBlocked {
