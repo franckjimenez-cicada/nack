@@ -89,6 +89,17 @@ type JetStreamController interface {
 	// reads to know the external backup completed. Value must match
 	// the CR's current generation (decimal) for the gate to clear.
 	BackupConfirmedAnnotation() string
+
+	// PassiveRoleTranslationEnabled returns true when the controller
+	// should consult the `drp.cicada.io/local-role` namespace
+	// annotation and translate primary-form CRs to mirror form at
+	// the NATS-server level. See Config.EnablePassiveRoleTranslation.
+	PassiveRoleTranslationEnabled() bool
+
+	// CrossRegionNATSDomain is the peer region's JetStream domain
+	// used when synthesizing mirror config under passive-role
+	// translation. Empty disables translation.
+	CrossRegionNATSDomain() string
 }
 
 func NewJSController(k8sClient client.Client, natsConfig *NatsConfig, controllerConfig *Config) (JetStreamController, error) {
@@ -147,6 +158,14 @@ func (c *jsController) BackupConfirmedAnnotation() string {
 		return defaultBackupConfirmedAnnotation
 	}
 	return c.controllerConfig.BackupConfirmedAnnotation
+}
+
+func (c *jsController) PassiveRoleTranslationEnabled() bool {
+	return c.controllerConfig.EnablePassiveRoleTranslation
+}
+
+func (c *jsController) CrossRegionNATSDomain() string {
+	return c.controllerConfig.CrossRegionNATSDomain
 }
 
 func (c *jsController) ValidNamespace(namespace string) bool {
@@ -559,6 +578,51 @@ func removeBackupRequiredCondition(conditions []api.Condition) []api.Condition {
 	out := conditions[:0]
 	for _, c := range conditions {
 		if c.Type == conditionBackupRequired {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// updatePassiveRoleTranslatedCondition upserts the PassiveRoleTranslated
+// condition. Status=True when the most recent reconcile rewrote the CR's
+// spec to mirror form at the NATS-server level (CR untouched). Reason
+// carries the source domain so an operator can verify which peer the
+// translation pointed at.
+func updatePassiveRoleTranslatedCondition(conditions []api.Condition, status v1.ConditionStatus, reason string, message string) []api.Condition {
+	var currentStatus v1.ConditionStatus
+	var lastTransitionTime string
+	for _, condition := range conditions {
+		if condition.Type == conditionPassiveRoleTranslated {
+			currentStatus = condition.Status
+			lastTransitionTime = condition.LastTransitionTime
+			break
+		}
+	}
+	if lastTransitionTime == "" || currentStatus != status {
+		lastTransitionTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	newCondition := api.Condition{
+		Type:               conditionPassiveRoleTranslated,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: lastTransitionTime,
+	}
+	if conditions == nil {
+		return []api.Condition{newCondition}
+	}
+	return js.UpsertCondition(conditions, newCondition)
+}
+
+// removePassiveRoleTranslatedCondition strips the PassiveRoleTranslated
+// condition. Use after a reconcile pass that did NOT translate (e.g.
+// namespace became active, or the feature was disabled).
+func removePassiveRoleTranslatedCondition(conditions []api.Condition) []api.Condition {
+	out := conditions[:0]
+	for _, c := range conditions {
+		if c.Type == conditionPassiveRoleTranslated {
 			continue
 		}
 		out = append(out, c)

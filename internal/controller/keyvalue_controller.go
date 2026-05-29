@@ -183,9 +183,35 @@ func (r *KeyValueReconciler) deleteKeyValue(ctx context.Context, log logr.Logger
 }
 
 func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger, keyValue *api.KeyValue) error {
+	// Evaluate passive-role translation BEFORE any NATS interaction so
+	// the rest of the reconcile (mirror-flip detection, backup gate,
+	// UpdateKeyValue) all see the same "effective" spec. The K8s CR is
+	// NOT modified — translation is server-side only. See
+	// stream_controller.go for the matching block + full rationale,
+	// including the B1 mirror→primary safety guard.
+	translatePassive, localRole, translateErr := shouldTranslatePassiveRole(ctx, r.JetStreamController, keyValue.Namespace)
+	if translateErr != nil {
+		keyValue.Status.Conditions = updateReadyCondition(keyValue.Status.Conditions, v1.ConditionFalse, stateErrored, translateErr.Error())
+		if err := r.Status().Update(ctx, keyValue); err != nil {
+			log.Error(err, "Failed to update ready condition to Errored.")
+		}
+		return translateErr
+	}
+	effectiveSpec := &keyValue.Spec
+	if translatePassive {
+		translated := translateKeyValueSpecToMirror(&keyValue.Spec, r.CrossRegionNATSDomain())
+		effectiveSpec = &translated
+		log.Info("Passive-role translation active: applying mirror config to NATS server (K8s CR untouched).",
+			"localRole", localRolePassive,
+			"remoteDomain", r.CrossRegionNATSDomain(),
+			"namespace", keyValue.Namespace,
+			"bucket", keyValue.Spec.Bucket,
+		)
+	}
+
 	// Create or Update the KeyValue based on the spec
-	// Map spec to KeyValue targetConfig
-	targetConfig, err := keyValueSpecToConfig(&keyValue.Spec)
+	// Map effective spec (possibly translated) to KeyValue targetConfig
+	targetConfig, err := keyValueSpecToConfig(effectiveSpec)
 	if err != nil {
 		return fmt.Errorf("map spec to keyvalue targetConfig: %w", err)
 	}
@@ -195,6 +221,8 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 	// stream is "KV_<bucket>"; the probe + msg-count check use that.
 	var gated bool
 	var gatedReason, gatedMessage string
+	var passiveRoleGuardBlocked bool
+	var passiveRoleGuardMessage string
 
 	// UpdateKeyValue is called on every reconciliation when the stream is not to be deleted.
 	err = r.WithJetStreamClient(keyValue.Spec.ConnectionOpts, keyValue.Namespace, func(js jetstream.JetStream) error {
@@ -210,7 +238,20 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 
 		// Proactive source<->mirror flip handling. See the matching block in
 		// stream_controller.go for the rationale.
-		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, &keyValue.Spec) {
+		//
+		// Use the EFFECTIVE spec (possibly translated to mirror form) so
+		// passive-role translation triggers the destructive recreate path
+		// when the server still holds a primary KV stream.
+		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, effectiveSpec) {
+			// B1 safety guard — see stream_controller.go for rationale.
+			if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+				passiveRoleGuardBlocked = true
+				passiveRoleGuardMessage = passiveRoleGuardMsg(keyValue.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+				log.Error(nil, "Passive-role safety guard fired; skipping proactive destructive recreate.",
+					"namespace", keyValue.Namespace, "bucket", keyValue.Spec.Bucket,
+				)
+				return nil
+			}
 			gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
 			if gateErr != nil {
 				return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -225,8 +266,9 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				return nil
 			}
 			log.Info("Source<->mirror flip detected; force-recreating KeyValue.",
-				"specHasMirror", keyValue.Spec.Mirror != nil,
+				"specHasMirror", effectiveSpec.Mirror != nil,
 				"serverHasMirror", serverState.Mirror != nil,
+				"translated", translatePassive,
 			)
 			if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
 				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
@@ -270,6 +312,17 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				// Reactive fallback: recreate the underlying KV stream when
 				// NATS rejects the update as mirror-incompatible.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					// B1 safety guard (reactive site) — see stream_controller.go
+					// for full rationale, including the note on serverState
+					// staleness across the UpdateKeyValue boundary.
+					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+						passiveRoleGuardBlocked = true
+						passiveRoleGuardMessage = passiveRoleGuardMsg(keyValue.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+						log.Error(nil, "Passive-role safety guard fired; skipping reactive destructive recreate.",
+							"namespace", keyValue.Namespace, "bucket", keyValue.Spec.Bucket, "natsErr", err.Error(),
+						)
+						return nil
+					}
 					gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
 					if gateErr != nil {
 						return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -333,6 +386,18 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 
 		return nil
 	})
+	// Bake the PassiveRoleTranslated audit condition BEFORE any branch
+	// writes Status — see stream_controller.go for rationale.
+	if translatePassive {
+		keyValue.Status.Conditions = updatePassiveRoleTranslatedCondition(
+			keyValue.Status.Conditions, v1.ConditionTrue,
+			"PassiveRole",
+			fmt.Sprintf("Translated to mirror from $JS.%s.API", r.CrossRegionNATSDomain()),
+		)
+	} else {
+		keyValue.Status.Conditions = removePassiveRoleTranslatedCondition(keyValue.Status.Conditions)
+	}
+
 	if err != nil {
 		err = fmt.Errorf("create or update keyvalue: %w", err)
 		keyValue.Status.Conditions = updateReadyCondition(keyValue.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
@@ -340,6 +405,16 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			log.Error(err, "Failed to update ready condition to Errored.")
 		}
 		return err
+	}
+
+	if passiveRoleGuardBlocked {
+		keyValue.Status.Conditions = updateReadyCondition(
+			keyValue.Status.Conditions, v1.ConditionFalse, stateErrored, passiveRoleGuardMessage,
+		)
+		if err := r.Status().Update(ctx, keyValue); err != nil {
+			return fmt.Errorf("update Ready=Errored after passive-role guard: %w", err)
+		}
+		return nil
 	}
 
 	if gated {

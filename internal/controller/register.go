@@ -80,6 +80,29 @@ type Config struct {
 	// `system:serviceaccount:<ns>:<sa>`. Empty falls back to
 	// webhook.DefaultDRPOperatorServiceAccount.
 	DRPOperatorSA string
+
+	// EnablePassiveRoleTranslation, when true, makes the Stream and
+	// KeyValue reconcilers consult the `drp.cicada.io/local-role`
+	// annotation on the CR's namespace. When the annotation is
+	// `passive`, the reconciler synthesizes a mirror config from
+	// CrossRegionNATSDomain + spec.name (Stream) or KV_<bucket> (KV)
+	// and applies that to the NATS server INSTEAD of the primary form
+	// the CR may carry. The K8s CR is NOT modified — translation is
+	// server-side only. Off by default.
+	//
+	// Pairs with CrossRegionNATSDomain: without a remote domain, the
+	// controller can't synthesize the mirror externalApiPrefix, so
+	// translation is skipped even when the annotation is present.
+	EnablePassiveRoleTranslation bool
+
+	// CrossRegionNATSDomain is the JetStream domain of the peer
+	// region used to synthesize `externalApiPrefix=$JS.<domain>.API`
+	// when EnablePassiveRoleTranslation fires. Example: when the
+	// controller runs on dev-west with east as peer, the value is
+	// "dev-2nd-east" — produced externalApiPrefix becomes
+	// "$JS.dev-2nd-east.API". Empty disables translation regardless
+	// of the namespace annotation.
+	CrossRegionNATSDomain string
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.

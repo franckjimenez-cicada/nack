@@ -187,6 +187,48 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 	// whether to short-circuit the success-path Ready=True update.
 	var gated bool
 	var gatedReason, gatedMessage string
+	// passiveRoleGuardBlocked is set when the B1 safety guard fires:
+	// namespace says passive but the controller would otherwise demote a
+	// translated mirror back to primary (feature flag toggled off
+	// mid-life). Treated the same as `gated` — status surfaces Ready=False
+	// with a clear reason and the success path is skipped.
+	var passiveRoleGuardBlocked bool
+	var passiveRoleGuardMessage string
+
+	// Evaluate passive-role translation BEFORE touching NATS so the
+	// rest of the reconcile (server state probe, mirror-flip detection,
+	// backup gate, UpdateConfiguration) all see the same "effective"
+	// spec. The original stream object is left untouched — translation
+	// is server-side only, so ArgoCD continues to see the chart's
+	// primary form on the CR and stays Synced/Healthy.
+	//
+	// localRole is returned regardless of the feature gate so the
+	// downstream destructive-recreate guard can refuse to demote a
+	// translated mirror back to primary when the ns is still passive
+	// (B1: protects against operator toggling the feature flag off mid-life).
+	translatePassive, localRole, translateErr := shouldTranslatePassiveRole(ctx, r.JetStreamController, stream.Namespace)
+	if translateErr != nil {
+		// Reading the namespace failed (network blip / RBAC gap). Surface
+		// as a reconcile error rather than silently treating as active —
+		// silent fallthrough could destructively recreate a stream we
+		// were meant to keep mirroring.
+		stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, translateErr.Error())
+		if err := r.Status().Update(ctx, stream); err != nil {
+			log.Error(err, "Failed to update ready condition to Errored.")
+		}
+		return translateErr
+	}
+	effectiveSpec := &stream.Spec
+	if translatePassive {
+		translated := translateStreamSpecToMirror(&stream.Spec, r.CrossRegionNATSDomain())
+		effectiveSpec = &translated
+		log.Info("Passive-role translation active: applying mirror config to NATS server (K8s CR untouched).",
+			"localRole", localRolePassive,
+			"remoteDomain", r.CrossRegionNATSDomain(),
+			"namespace", stream.Namespace,
+			"streamName", stream.Spec.Name,
+		)
+	}
 
 	// CreateOrUpdateStream is called on every reconciliation when the stream is not to be deleted.
 	err := r.WithJSMClient(stream.Spec.ConnectionOpts, stream.Namespace, func(js *jsm.Manager) error {
@@ -200,8 +242,9 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			return err
 		}
 
-		// Map spec to stream targetConfig, passing current server state for context
-		targetConfig, err := streamSpecToConfig(&stream.Spec, serverState)
+		// Map effective spec (possibly translated) to stream targetConfig,
+		// passing current server state for context.
+		targetConfig, err := streamSpecToConfig(effectiveSpec, serverState)
 		if err != nil {
 			return fmt.Errorf("map spec to stream targetConfig: %w", err)
 		}
@@ -220,7 +263,28 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// already holding this stream's data, or (b) an external operator
 		// confirming a backup via the configured annotation. See
 		// streamBackupGate below for the full predicate.
-		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, &stream.Spec) {
+		// Pass the EFFECTIVE spec (possibly translated to mirror form) into
+		// the flip detector so that, under passive-role translation, the
+		// "old server is primary, new spec is mirror" path is recognized
+		// and the destructive recreate runs against the synthesized mirror
+		// — not the chart's primary form.
+		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, effectiveSpec) {
+			// B1 safety guard: refuse the destructive recreate when the
+			// flip direction is mirror → primary AND the namespace is
+			// still annotated `local-role=passive`. The only realistic
+			// way to reach this branch is operator misconfig (feature
+			// flag toggled off while the ns annotation still says
+			// passive) — destroying the mirror would lose the in-flight
+			// replicated state and seed split-brain. Surface as
+			// non-Ready + a clear status reason and bail.
+			if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+				passiveRoleGuardBlocked = true
+				passiveRoleGuardMessage = passiveRoleGuardMsg(stream.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+				log.Error(nil, "Passive-role safety guard fired; skipping proactive destructive recreate.",
+					"namespace", stream.Namespace, "streamName", stream.Spec.Name,
+				)
+				return nil
+			}
 			gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 			if gateErr != nil {
 				return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -235,8 +299,9 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				return nil
 			}
 			log.Info("Source<->mirror flip detected; force-recreating Stream.",
-				"specHasMirror", stream.Spec.Mirror != nil,
+				"specHasMirror", effectiveSpec.Mirror != nil,
 				"serverHasMirror", serverState.Mirror != nil,
+				"translated", translatePassive,
 			)
 			if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
 				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
@@ -286,6 +351,29 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				// change requires source<->mirror flip, force-delete and
 				// re-create. Bounded to a single retry.
 				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+					// B1 safety guard (reactive site): the proactive
+					// branch's predicate did not fire (maybe serverState
+					// wasn't yet mirror at the proactive check), but
+					// NATS's mirror-incompatible error tells us the
+					// effective-spec / server pair is mismatched. Refuse
+					// the reactive delete on the same condition.
+					//
+					// serverState here is the read from before
+					// UpdateConfiguration was attempted. A concurrent
+					// external mutation between read and update could
+					// stale this — but a misfire is recoverable: false
+					// negative falls through to streamBackupGate (which
+					// itself blocks destructive recreate); false positive
+					// just costs one extra Ready=Errored cycle before
+					// the next reconcile re-reads fresh state.
+					if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
+						passiveRoleGuardBlocked = true
+						passiveRoleGuardMessage = passiveRoleGuardMsg(stream.Namespace, r.PassiveRoleTranslationEnabled(), r.CrossRegionNATSDomain())
+						log.Error(nil, "Passive-role safety guard fired; skipping reactive destructive recreate.",
+							"namespace", stream.Namespace, "streamName", stream.Spec.Name, "natsErr", err.Error(),
+						)
+						return nil
+					}
 					gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 					if gateErr != nil {
 						return fmt.Errorf("evaluate backup gate: %w", gateErr)
@@ -344,6 +432,21 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 
 		return nil
 	})
+	// Bake the PassiveRoleTranslated audit condition into the conditions
+	// slice BEFORE any branch writes Status — so the closure-err path,
+	// guard path, gate path, and success path all surface the same audit
+	// signal. The condition value reflects whether translation was
+	// ATTEMPTED this pass, not whether downstream NATS calls succeeded.
+	if translatePassive {
+		stream.Status.Conditions = updatePassiveRoleTranslatedCondition(
+			stream.Status.Conditions, v1.ConditionTrue,
+			"PassiveRole",
+			fmt.Sprintf("Translated to mirror from $JS.%s.API", r.CrossRegionNATSDomain()),
+		)
+	} else {
+		stream.Status.Conditions = removePassiveRoleTranslatedCondition(stream.Status.Conditions)
+	}
+
 	if err != nil {
 		err = fmt.Errorf("create or update stream: %w", err)
 		stream.Status.Conditions = updateReadyCondition(stream.Status.Conditions, v1.ConditionFalse, stateErrored, err.Error())
@@ -351,6 +454,20 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			log.Error(err, "Failed to update ready condition to Errored.")
 		}
 		return err
+	}
+
+	if passiveRoleGuardBlocked {
+		// Mirror→primary destructive recreate refused because the ns is
+		// still passive. Do NOT bump observedGeneration — the next
+		// reconcile should re-evaluate once the operator clears the
+		// misconfig (flip the flag, or clear the annotation).
+		stream.Status.Conditions = updateReadyCondition(
+			stream.Status.Conditions, v1.ConditionFalse, stateErrored, passiveRoleGuardMessage,
+		)
+		if err := r.Status().Update(ctx, stream); err != nil {
+			return fmt.Errorf("update Ready=Errored after passive-role guard: %w", err)
+		}
+		return nil
 	}
 
 	if gated {
