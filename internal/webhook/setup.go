@@ -34,6 +34,11 @@ type Options struct {
 	// namespace. Format: `system:serviceaccount:<ns>:<sa>`. Empty falls
 	// back to DefaultDRPOperatorServiceAccount.
 	DRPOperatorSA string
+
+	// DefaultAccount is the NATS account an unlabeled Stream/KeyValue CR
+	// resolves to during the account-aware sibling-conflict comparison.
+	// Empty falls back to webhook.DefaultNATSAccount ("JS").
+	DefaultAccount string
 }
 
 // SetupWithManager registers the Stream + KeyValue sibling-conflict validators
@@ -56,15 +61,17 @@ func SetupWithManager(mgr ctrl.Manager, opts Options) error {
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-stream",
 		admission.WithValidator[*api.Stream](scheme, &StreamValidator{
-			Client:        mgr.GetClient(),
-			DRPOperatorSA: opts.DRPOperatorSA,
+			Client:         mgr.GetClient(),
+			DRPOperatorSA:  opts.DRPOperatorSA,
+			DefaultAccount: opts.DefaultAccount,
 		}),
 	)
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-keyvalue",
 		admission.WithValidator[*api.KeyValue](scheme, &KeyValueValidator{
-			Client:        mgr.GetClient(),
-			DRPOperatorSA: opts.DRPOperatorSA,
+			Client:         mgr.GetClient(),
+			DRPOperatorSA:  opts.DRPOperatorSA,
+			DefaultAccount: opts.DefaultAccount,
 		}),
 	)
 

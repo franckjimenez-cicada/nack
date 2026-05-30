@@ -245,6 +245,39 @@ func TestStreamValidator_ValidateDelete_AlwaysAllow(t *testing.T) {
 
 // --- account-aware sibling-check (2026-05-26) ---------------------------
 
+// testDefaultAccount is the configurable default account the tests wire into
+// the validators, exercising the --default-account flag's normalization path.
+const testDefaultAccount = "JS"
+
+// TestDifferentAccounts_Normalization locks the resolve-then-compare table
+// directly on the helper (the four cases from the fix's doc comment) plus
+// the empty-default fallback to DefaultNATSAccount.
+func TestDifferentAccounts_Normalization(t *testing.T) {
+	lbl := func(v string) map[string]string { return map[string]string{NATSAccountLabel: v} }
+
+	cases := []struct {
+		name           string
+		self, other    map[string]string
+		defaultAccount string
+		wantDifferent  bool
+	}{
+		{"unlabeled vs labeled-nats-qa", nil, lbl("nats-qa"), "JS", true},
+		{"labeled-nats-qa vs unlabeled", lbl("nats-qa"), nil, "JS", true},
+		{"unlabeled vs unlabeled", nil, nil, "JS", false},
+		{"labeled-JS vs labeled-nats-qa", lbl("JS"), lbl("nats-qa"), "JS", true},
+		{"labeled-JS vs labeled-JS", lbl("JS"), lbl("JS"), "JS", false},
+		{"unlabeled vs label==default", nil, lbl("JS"), "JS", false},
+		{"empty-string label treated as unlabeled", lbl(""), lbl("nats-qa"), "JS", true},
+		{"empty default falls back to canonical", nil, lbl("nats-qa"), "", true},
+		{"empty default: both unlabeled => same", nil, nil, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.wantDifferent, differentAccounts(tc.self, tc.other, tc.defaultAccount))
+		})
+	}
+}
+
 // Same spec.name but DIFFERENT NATS accounts => not a conflict.
 // This is the bug from the failover-js--drp-orchestrator-rkpvx drill:
 // activitylog-dev-2nd-east (account=JS) was rejected because
@@ -252,7 +285,7 @@ func TestStreamValidator_ValidateDelete_AlwaysAllow(t *testing.T) {
 func TestStreamValidator_SameSpecName_DifferentAccounts_Allow(t *testing.T) {
 	existing := newStreamWithAccount("activitylog-qa-2nd-east", "activitylog", "nats-qa")
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &StreamValidator{Client: c}
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newStreamWithAccount("activitylog-dev-2nd-east", "activitylog", "JS")
 	_, err := v.ValidateCreate(context.Background(), self)
@@ -263,7 +296,7 @@ func TestStreamValidator_SameSpecName_DifferentAccounts_Allow(t *testing.T) {
 func TestStreamValidator_SameSpecName_SameAccount_Reject(t *testing.T) {
 	existing := newStreamWithAccount("orders-primary", "ORDERS", "JS")
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &StreamValidator{Client: c}
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newStreamWithAccount("orders-mirror", "ORDERS", "JS")
 	_, err := v.ValidateCreate(context.Background(), self)
@@ -271,28 +304,59 @@ func TestStreamValidator_SameSpecName_SameAccount_Reject(t *testing.T) {
 	require.Contains(t, err.Error(), "ORDERS")
 }
 
-// Neither CR carries the label => fall through to legacy conflict logic
-// (backward compatibility). Verified separately from the labeled cases.
+// Neither CR carries the label => both resolve to the default account =>
+// still a conflict. This is the backward-compatible case: unlabeled-vs-
+// unlabeled keeps the legacy conservative behavior.
 func TestStreamValidator_SameSpecName_NoAccountLabel_Reject(t *testing.T) {
 	existing := newStream("orders-primary", "ORDERS", nil)
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &StreamValidator{Client: c}
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newStream("orders-mirror", "ORDERS", nil)
 	_, err := v.ValidateCreate(context.Background(), self)
-	require.Error(t, err, "unlabeled CRs must keep legacy conservative behavior")
+	require.Error(t, err, "two unlabeled CRs both resolve to the default account => conflict")
 }
 
-// Only one side labeled => conservative: still a conflict (we can't prove
-// the other side belongs to a different account, so reject).
-func TestStreamValidator_SameSpecName_OneSideLabeled_Reject(t *testing.T) {
-	existing := newStreamWithAccount("orders-primary", "ORDERS", "JS")
+// THE FIX (dev-west 2026-05-30): an UNLABELED CR is the implicit DEFAULT
+// account. An unlabeled JS stream (cob-orders-producer-dev) must NOT collide
+// with its labeled nats-qa sibling (cob-orders-producer-qa) sharing the same
+// spec.name. Pre-fix this rejected the QA CR and blocked the whole
+// nacks-streams-sync-qa ArgoCD sync.
+func TestStreamValidator_UnlabeledVsLabeledDifferent_Allow(t *testing.T) {
+	// Live unlabeled JS sibling (implicit default account).
+	existing := newStream("cob-orders-producer-dev", "cob-orders-producer", nil)
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &StreamValidator{Client: c}
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
 
-	self := newStream("orders-mirror", "ORDERS", nil) // unlabeled
+	// Labeled nats-qa CR being admitted.
+	self := newStreamWithAccount("cob-orders-producer-qa", "cob-orders-producer", "nats-qa")
 	_, err := v.ValidateCreate(context.Background(), self)
-	require.Error(t, err, "missing label on one side must NOT relax the check")
+	require.NoError(t, err, "unlabeled (default account) vs labeled non-default must not collide")
+}
+
+// Symmetric to the above: admitting the unlabeled default-account CR while
+// the labeled non-default sibling is already live must also be allowed
+// (this is the deadlock half — each side validated against the other).
+func TestStreamValidator_LabeledDifferentVsUnlabeled_Allow(t *testing.T) {
+	existing := newStreamWithAccount("cob-orders-producer-qa", "cob-orders-producer", "nats-qa")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
+
+	self := newStream("cob-orders-producer-dev", "cob-orders-producer", nil) // unlabeled => "JS"
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.NoError(t, err, "labeled non-default vs unlabeled (default account) must not collide")
+}
+
+// Unlabeled CR vs a labeled CR that resolves to the SAME default account
+// (label value == the configured default) => still a conflict.
+func TestStreamValidator_UnlabeledVsLabeledDefault_Reject(t *testing.T) {
+	existing := newStreamWithAccount("orders-primary", "ORDERS", testDefaultAccount)
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
+
+	self := newStream("orders-mirror", "ORDERS", nil) // unlabeled => default
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err, "unlabeled and label==default both resolve to the default account => conflict")
 }
 
 // Mirror-relationship rules (rule 2/3) also respect the account filter.
@@ -307,7 +371,7 @@ func TestStreamValidator_MirrorAcrossDifferentAccounts_Allow(t *testing.T) {
 		Spec: api.StreamSpec{Name: "ORDERS-MIRROR", Mirror: &api.StreamSource{Name: "ORDERS"}},
 	}
 	c := newFakeClient(t, newNamespace(testNS, ""), mirror)
-	v := &StreamValidator{Client: c}
+	v := &StreamValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newStreamWithAccount("orders-primary", "ORDERS", "JS")
 	_, err := v.ValidateCreate(context.Background(), self)
@@ -317,7 +381,7 @@ func TestStreamValidator_MirrorAcrossDifferentAccounts_Allow(t *testing.T) {
 func TestKeyValueValidator_SameBucket_DifferentAccounts_Allow(t *testing.T) {
 	existing := newKVWithAccount("config-qa", "CONFIG", "nats-qa")
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &KeyValueValidator{Client: c}
+	v := &KeyValueValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newKVWithAccount("config-js", "CONFIG", "JS")
 	_, err := v.ValidateCreate(context.Background(), self)
@@ -327,10 +391,34 @@ func TestKeyValueValidator_SameBucket_DifferentAccounts_Allow(t *testing.T) {
 func TestKeyValueValidator_SameBucket_SameAccount_Reject(t *testing.T) {
 	existing := newKVWithAccount("config-primary", "CONFIG", "JS")
 	c := newFakeClient(t, newNamespace(testNS, ""), existing)
-	v := &KeyValueValidator{Client: c}
+	v := &KeyValueValidator{Client: c, DefaultAccount: testDefaultAccount}
 
 	self := newKVWithAccount("config-mirror", "CONFIG", "JS")
 	_, err := v.ValidateCreate(context.Background(), self)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "CONFIG")
+}
+
+// KV variant of THE FIX: unlabeled (default account) bucket vs labeled
+// non-default bucket of the same name => not a conflict (consumer-offsets-qa
+// incident half).
+func TestKeyValueValidator_UnlabeledVsLabeledDifferent_Allow(t *testing.T) {
+	existing := newKV("consumer-offsets-dev", "consumer-offsets") // unlabeled => default
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &KeyValueValidator{Client: c, DefaultAccount: testDefaultAccount}
+
+	self := newKVWithAccount("consumer-offsets-qa", "consumer-offsets", "nats-qa")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.NoError(t, err, "unlabeled (default account) vs labeled non-default KV must not collide")
+}
+
+// KV unlabeled-vs-unlabeled still conflicts (default vs default).
+func TestKeyValueValidator_SameBucket_NoLabel_Reject(t *testing.T) {
+	existing := newKV("config-primary", "CONFIG")
+	c := newFakeClient(t, newNamespace(testNS, ""), existing)
+	v := &KeyValueValidator{Client: c, DefaultAccount: testDefaultAccount}
+
+	self := newKV("config-mirror", "CONFIG")
+	_, err := v.ValidateCreate(context.Background(), self)
+	require.Error(t, err, "two unlabeled KV CRs both resolve to the default account => conflict")
 }

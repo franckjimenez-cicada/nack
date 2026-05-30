@@ -81,6 +81,14 @@ type Config struct {
 	// webhook.DefaultDRPOperatorServiceAccount.
 	DRPOperatorSA string
 
+	// DefaultAccount is the NATS account an UNLABELED Stream/KeyValue CR
+	// resolves to in the account-aware sibling-conflict comparison. Chart
+	// entries that omit `account` are the implicit default account; an
+	// unlabeled CR (default account) must NOT collide with a labeled
+	// non-default sibling sharing the same spec.name. Empty falls back to
+	// webhook.DefaultNATSAccount ("JS").
+	DefaultAccount string
+
 	// EnablePassiveRoleTranslation, when true, makes the Stream and
 	// KeyValue reconcilers consult the `drp.cicada.io/local-role`
 	// annotation on the CR's namespace. When the annotation is

@@ -52,31 +52,50 @@ const DrillActiveAnnotation = "drp.cicada.io/drill-active"
 // resolve to different server-side streams (one per account) and therefore
 // do NOT conflict at the NATS layer.
 //
-// Our chart sets values like "JS" or "nats-qa". The label is OPTIONAL: when
-// absent on either side, we fall back to the conservative legacy behavior
-// (treat as potential conflict) so this change is backward-compatible.
+// Our chart sets values like "JS" or "nats-qa". The label is OPTIONAL: a CR
+// WITHOUT the label belongs to the implicit DEFAULT account (chart entries
+// that omit `account` land in the default account). We normalize an
+// absent/empty label to the configured default account before comparing, so
+// an unlabeled CR (implicit default) is correctly distinguished from a
+// labeled non-default sibling. See resolveAccount / differentAccounts.
 const NATSAccountLabel = "drp.cicada.io/nats-account"
 
-// accountLabel returns (value, present) for the NATS account label on an
-// object's metadata. A nil map or missing key returns ("", false).
-func accountLabel(labels map[string]string) (string, bool) {
-	if labels == nil {
-		return "", false
+// DefaultNATSAccount is the canonical default NATS account name an unlabeled
+// CR resolves to. Per the cluster convention the account label values are
+// "JS" (default) and "nats-qa"; chart entries that omit `account` are the
+// implicit "JS" account. Used as the fallback when no --default-account is
+// configured on a validator, keeping the normalization backward-compatible.
+const DefaultNATSAccount = "JS"
+
+// resolveAccount returns the effective NATS account for a CR's labels: the
+// label value when present and non-empty, otherwise the supplied default
+// account. An empty defaultAccount itself falls back to DefaultNATSAccount so
+// a validator constructed without wiring the flag still normalizes correctly.
+func resolveAccount(labels map[string]string, defaultAccount string) string {
+	if defaultAccount == "" {
+		defaultAccount = DefaultNATSAccount
 	}
-	v, ok := labels[NATSAccountLabel]
-	return v, ok && v != ""
+	if labels != nil {
+		if v, ok := labels[NATSAccountLabel]; ok && v != "" {
+			return v
+		}
+	}
+	return defaultAccount
 }
 
-// differentAccounts returns true iff BOTH sides carry the account label and
-// the values differ. When either side is unlabeled we return false so the
-// caller falls through to the legacy conflict logic (conservative default).
-func differentAccounts(selfLabels, otherLabels map[string]string) bool {
-	selfAcc, selfOK := accountLabel(selfLabels)
-	otherAcc, otherOK := accountLabel(otherLabels)
-	if !selfOK || !otherOK {
-		return false
-	}
-	return selfAcc != otherAcc
+// differentAccounts returns true iff the two CRs resolve to DIFFERENT NATS
+// accounts. Each side's account resolves to its label value when present, or
+// to defaultAccount otherwise (an unlabeled CR == the implicit default
+// account). Different resolved accounts => separate server-side streams =>
+// not a conflict, so the caller skips the sibling.
+//
+// Examples (default="JS"):
+//   - unlabeled (→"JS") vs labeled "nats-qa"      => true  (no conflict)
+//   - unlabeled (→"JS") vs unlabeled (→"JS")      => false (conflict kept)
+//   - labeled "JS"      vs labeled "nats-qa"      => true  (no conflict)
+//   - labeled "JS"      vs labeled "JS"           => false (conflict kept)
+func differentAccounts(selfLabels, otherLabels map[string]string, defaultAccount string) bool {
+	return resolveAccount(selfLabels, defaultAccount) != resolveAccount(otherLabels, defaultAccount)
 }
 
 // remediationHint is appended to every rejection so operators understand
@@ -136,7 +155,7 @@ func keyValueSpecName(kv *api.KeyValue) string {
 //     mirror CR pointing back at a primary that's already live)
 //  3. self IS a mirror whose spec.mirror.name equals another sibling's
 //     spec.name (symmetric: catches it from the other direction too)
-func findStreamConflict(ctx context.Context, c ctrlclient.Client, self *api.Stream) (*api.Stream, string, error) {
+func findStreamConflict(ctx context.Context, c ctrlclient.Client, self *api.Stream, defaultAccount string) (*api.Stream, string, error) {
 	list := &api.StreamList{}
 	if err := c.List(ctx, list, ctrlclient.InNamespace(self.Namespace)); err != nil {
 		return nil, "", fmt.Errorf("list streams in %q: %w", self.Namespace, err)
@@ -153,9 +172,10 @@ func findStreamConflict(ctx context.Context, c ctrlclient.Client, self *api.Stre
 
 		// account-aware filter: same spec.name across different NATS
 		// accounts is NOT a conflict (separate server-side streams).
-		// Only applies when BOTH CRs are labeled; absent labels fall
-		// through to the legacy logic (backward compatible).
-		if differentAccounts(self.Labels, other.Labels) {
+		// An absent/empty account label resolves to defaultAccount, so an
+		// unlabeled CR (implicit default account) is correctly compared
+		// against a labeled non-default sibling.
+		if differentAccounts(self.Labels, other.Labels, defaultAccount) {
 			continue
 		}
 
@@ -181,7 +201,7 @@ func findStreamConflict(ctx context.Context, c ctrlclient.Client, self *api.Stre
 // findKeyValueConflict applies the spec.bucket variant of findStreamConflict.
 // KV mirroring rules are simpler — only bucket-vs-bucket collisions are
 // checked because KV mirrors reuse the same bucket name verbatim.
-func findKeyValueConflict(ctx context.Context, c ctrlclient.Client, self *api.KeyValue) (*api.KeyValue, string, error) {
+func findKeyValueConflict(ctx context.Context, c ctrlclient.Client, self *api.KeyValue, defaultAccount string) (*api.KeyValue, string, error) {
 	list := &api.KeyValueList{}
 	if err := c.List(ctx, list, ctrlclient.InNamespace(self.Namespace)); err != nil {
 		return nil, "", fmt.Errorf("list keyvalues in %q: %w", self.Namespace, err)
@@ -198,7 +218,7 @@ func findKeyValueConflict(ctx context.Context, c ctrlclient.Client, self *api.Ke
 			continue
 		}
 		// account-aware filter (see findStreamConflict for rationale).
-		if differentAccounts(self.Labels, other.Labels) {
+		if differentAccounts(self.Labels, other.Labels, defaultAccount) {
 			continue
 		}
 		if keyValueSpecName(other) == selfBucket {
@@ -224,6 +244,11 @@ type StreamValidator struct {
 	// falls back to DefaultDRPOperatorServiceAccount via the gate. Wired
 	// at boot from the --drp-operator-sa flag in cmd/jetstream-controller.
 	DRPOperatorSA string
+	// DefaultAccount is the NATS account an UNLABELED CR resolves to when
+	// comparing siblings (chart entries that omit `account` are the implicit
+	// default account). Empty falls back to DefaultNATSAccount ("JS"). Wired
+	// at boot from the --default-account flag in cmd/jetstream-controller.
+	DefaultAccount string
 }
 
 var _ admission.Validator[*api.Stream] = &StreamValidator{}
@@ -269,7 +294,7 @@ func (v *StreamValidator) validate(ctx context.Context, obj *api.Stream) (admiss
 	// operator-only gate fires only inside drill windows on scope-labeled
 	// CRs; everything else (chart steady-state, manual kubectl outside a
 	// drill, drill-active without scope label) falls through here.
-	sibling, reason, err := findStreamConflict(ctx, v.Client, obj)
+	sibling, reason, err := findStreamConflict(ctx, v.Client, obj, v.DefaultAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +323,8 @@ type KeyValueValidator struct {
 	Client ctrlclient.Client
 	// DRPOperatorSA — see StreamValidator.DRPOperatorSA. Same semantics.
 	DRPOperatorSA string
+	// DefaultAccount — see StreamValidator.DefaultAccount. Same semantics.
+	DefaultAccount string
 }
 
 var _ admission.Validator[*api.KeyValue] = &KeyValueValidator{}
@@ -331,7 +358,7 @@ func (v *KeyValueValidator) validate(ctx context.Context, obj *api.KeyValue) (ad
 	}
 
 	// Step 2: legacy sibling-conflict check.
-	sibling, reason, err := findKeyValueConflict(ctx, v.Client, obj)
+	sibling, reason, err := findKeyValueConflict(ctx, v.Client, obj, v.DefaultAccount)
 	if err != nil {
 		return nil, err
 	}
