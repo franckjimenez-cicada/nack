@@ -96,6 +96,8 @@ func run() error {
 	backupConfirmedAnnotation := flag.String("backup-confirmed-annotation", "drp.cicada.io/backup-confirmed-generation", "Annotation key the controller reads to know an external backup operator has captured the CR's local state. Value must equal the CR's metadata.generation as a decimal string.")
 	drpOperatorSA := flag.String("drp-operator-sa", webhook.DefaultDRPOperatorServiceAccount,
 		"ServiceAccount username (format `system:serviceaccount:<ns>:<sa>`) allowed to mutate scope-labeled Stream/KeyValue CRs while the namespace carries the drill-active annotation. Defaults to the dev/stg convention; override for prod or other environments where drp-operator runs under a different namespace/SA.")
+	defaultAccount := flag.String("default-account", webhook.DefaultNATSAccount,
+		"NATS account name an UNLABELED Stream/KeyValue CR resolves to in the account-aware sibling-conflict webhook. Chart entries that omit `account` are the implicit default account; with this flag an unlabeled CR (e.g. a JS stream) no longer collides with a labeled non-default sibling (e.g. its nats-qa twin sharing the same spec.name). Defaults to the canonical default account.")
 	enablePassiveRoleTranslation := flag.Bool("enable-passive-role-translation", false,
 		"Translate primary-form Stream/KeyValue CRs to mirror form when the namespace carries `drp.cicada.io/local-role=passive`. The K8s CR is NOT modified — translation only affects what is applied to the NATS server. Eliminates the ArgoCD selfHeal vs drp-operator race on the passive region post-flip. Requires --cross-region-nats-domain to be set; off by default.")
 	crossRegionNATSDomain := flag.String("cross-region-nats-domain", "",
@@ -150,6 +152,7 @@ func run() error {
 			CrossRegionNATSCredsPath:     *crossRegionNATSCredsPath,
 			BackupConfirmedAnnotation:    *backupConfirmedAnnotation,
 			DRPOperatorSA:                *drpOperatorSA,
+			DefaultAccount:               *defaultAccount,
 			EnablePassiveRoleTranslation: *enablePassiveRoleTranslation,
 			CrossRegionNATSDomain:        *crossRegionNATSDomain,
 		}
@@ -277,7 +280,8 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 
 	if controllerCfg.EnableSiblingWebhook {
 		if err := webhook.SetupWithManager(mgr, webhook.Options{
-			DRPOperatorSA: controllerCfg.DRPOperatorSA,
+			DRPOperatorSA:  controllerCfg.DRPOperatorSA,
+			DefaultAccount: controllerCfg.DefaultAccount,
 		}); err != nil {
 			return fmt.Errorf("register sibling-conflict webhook: %w", err)
 		}
