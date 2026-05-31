@@ -72,7 +72,7 @@ func scopedKV(metaName, bucket string) *api.KeyValue {
 // compact while still threading the configurable operator-SA through. Most
 // tests pin the canonical default; the configured-SA test below overrides.
 func callGate(ctx context.Context, c ctrlclient.Client, obj objectLabels) (bool, string, string, error) {
-	return drillActiveOperatorGate(ctx, c, obj, DefaultDRPOperatorServiceAccount)
+	return drillActiveOperatorGate(ctx, c, obj, DefaultDRPOperatorServiceAccount, DefaultControllerServiceAccount)
 }
 
 // ctxWithUser threads an admission.Request carrying the given username onto
@@ -246,14 +246,14 @@ func TestDrillActiveGate_ConfiguredOperatorSA(t *testing.T) {
 
 	t.Run("configured-SA-allowed", func(t *testing.T) {
 		ctx := ctxWithUser(prodOperatorSA)
-		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA)
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA, DefaultControllerServiceAccount)
 		require.NoError(t, err)
 		require.True(t, allowed, "configured operator SA must be allowed")
 	})
 
 	t.Run("dev-default-SA-rejected-under-prod-config", func(t *testing.T) {
 		ctx := ctxWithUser(DefaultDRPOperatorServiceAccount)
-		allowed, _, denyReason, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA)
+		allowed, _, denyReason, err := drillActiveOperatorGate(ctx, c, self, prodOperatorSA, DefaultControllerServiceAccount)
 		require.NoError(t, err)
 		require.False(t, allowed,
 			"dev-default SA must NOT be silently accepted when prod SA is configured")
@@ -265,10 +265,162 @@ func TestDrillActiveGate_ConfiguredOperatorSA(t *testing.T) {
 		// to DefaultDRPOperatorServiceAccount so a missing flag wire-up
 		// doesn't open the gate to everyone.
 		ctx := ctxWithUser(DefaultDRPOperatorServiceAccount)
-		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, "")
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, "", "")
 		require.NoError(t, err)
 		require.True(t, allowed, "empty configured SA must fall back to the default — not allow everyone")
 	})
+}
+
+// --- controller-self SA exemption (live deadlock 2026-05-31) ------------
+//
+// The gate originally exempted ONLY the drp-operator SA. nack's own
+// controller (`system:serviceaccount:nats:jetstream-controller`) was
+// rejected when it issued the finalizer-removal UPDATE while deleting a
+// scope-labeled CR on the operator's behalf — the CR stuck in Terminating,
+// the operator's wait-gone timed out, the drill failed. These tests pin the
+// regression: the controller-self SA must ALWAYS be allowed mid-drill, while
+// every other non-operator SA stays rejected.
+
+// TestDrillActiveGate_DrillScopeControllerSelf_Allow — the regression for
+// the 2026-05-31 deadlock. drill in flight + scope-labeled CR + requester is
+// nack's own controller SA → ALLOWED (so finalizer removal / reconcile can
+// proceed and the CR can leave Terminating).
+func TestDrillActiveGate_DrillScopeControllerSelf_Allow(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-31-xyz"))
+	self := scopedStream("orders-primary", "ORDERS")
+	ctx := ctxWithUser(DefaultControllerServiceAccount)
+
+	allowed, drillID, denyReason, err := callGate(ctx, c, self)
+	require.NoError(t, err)
+	require.True(t, allowed,
+		"drill+scope+controller-self: gate must ALLOW (nack must manage its own CRs/finalizers mid-drill)")
+	require.Equal(t, "drill-2026-05-31-xyz", drillID)
+	require.Empty(t, denyReason)
+}
+
+// TestDrillActiveGate_DrillScopeOther_RejectIncludesArgo confirms the gate
+// still REJECTS everyone else even after the controller-self exemption is
+// added — only the operator SA and the controller-self SA pass. ArgoCD and a
+// human stay blocked.
+func TestDrillActiveGate_DrillScopeOther_RejectIncludesArgo(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-31-xyz"))
+	self := scopedStream("orders-primary", "ORDERS")
+
+	for _, user := range []string{
+		"system:serviceaccount:argocd:argocd-application-controller",
+		"developer@example.com",
+		// a controller SA in the WRONG namespace must NOT be exempt — the
+		// exemption is the exact SA string, not a name-only match.
+		"system:serviceaccount:other-ns:jetstream-controller",
+	} {
+		t.Run("user="+user, func(t *testing.T) {
+			ctx := ctxWithUser(user)
+			allowed, _, denyReason, err := callGate(ctx, c, self)
+			require.NoError(t, err)
+			require.False(t, allowed, "non-operator, non-controller SA must be REJECTED")
+			require.Contains(t, denyReason, user)
+		})
+	}
+}
+
+// TestDrillActiveGate_ConfiguredSelfSA exercises the configurable override
+// of the controller-self SA: a cluster that renames the controller SA passes
+// the new value via --self-service-account, and the gate must compare
+// against THAT, not the hardcoded dev/stg default.
+func TestDrillActiveGate_ConfiguredSelfSA(t *testing.T) {
+	const customSelfSA = "system:serviceaccount:nats-east:jetstream-controller-east"
+
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-31-xyz"))
+	self := scopedStream("orders-primary", "ORDERS")
+
+	t.Run("configured-self-SA-allowed", func(t *testing.T) {
+		ctx := ctxWithUser(customSelfSA)
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, DefaultDRPOperatorServiceAccount, customSelfSA)
+		require.NoError(t, err)
+		require.True(t, allowed, "configured controller-self SA must be allowed")
+	})
+
+	t.Run("dev-default-self-SA-rejected-under-custom-config", func(t *testing.T) {
+		// When a non-default self SA is configured, the dev default must NOT
+		// be silently allowed (no name-only matching).
+		ctx := ctxWithUser(DefaultControllerServiceAccount)
+		allowed, _, denyReason, err := drillActiveOperatorGate(ctx, c, self, DefaultDRPOperatorServiceAccount, customSelfSA)
+		require.NoError(t, err)
+		require.False(t, allowed,
+			"dev-default controller SA must NOT be accepted when a custom self SA is configured")
+		require.Contains(t, denyReason, DefaultControllerServiceAccount)
+	})
+
+	t.Run("empty-selfSA-falls-back-to-default", func(t *testing.T) {
+		ctx := ctxWithUser(DefaultControllerServiceAccount)
+		allowed, _, _, err := drillActiveOperatorGate(ctx, c, self, DefaultDRPOperatorServiceAccount, "")
+		require.NoError(t, err)
+		require.True(t, allowed,
+			"empty self SA must fall back to DefaultControllerServiceAccount — not reject the controller")
+	})
+}
+
+// TestDefaultControllerServiceAccount_CanonicalValue pins nack's self SA to
+// the value it actually runs as in dev-west: SA name is the chart default
+// `jetstream-controller` (children/nacks jsc.serviceAccountName default),
+// namespace is `nats` (nacks ArgoCD Application destination namespace). If
+// the chart renames the SA cluster-wide, update this constant in lock-step
+// OR set --self-service-account.
+func TestDefaultControllerServiceAccount_CanonicalValue(t *testing.T) {
+	const want = "system:serviceaccount:nats:jetstream-controller"
+	require.Equal(t, want, DefaultControllerServiceAccount,
+		"nack chart deploys SA=jetstream-controller in ns=nats; self-SA constant must match")
+}
+
+// TestResolveControllerServiceAccount covers the override + POD_NAMESPACE
+// auto-detection precedence.
+func TestResolveControllerServiceAccount(t *testing.T) {
+	envWith := func(ns string) func(string) string {
+		return func(k string) string {
+			if k == PodNamespaceEnv {
+				return ns
+			}
+			return ""
+		}
+	}
+
+	cases := []struct {
+		name     string
+		override string
+		getenv   func(string) string
+		want     string
+	}{
+		{
+			name:     "override-wins",
+			override: "system:serviceaccount:custom:custom-sa",
+			getenv:   envWith("ignored-ns"),
+			want:     "system:serviceaccount:custom:custom-sa",
+		},
+		{
+			name:     "auto-detect-namespace-from-env",
+			override: "",
+			getenv:   envWith("nats-east"),
+			want:     "system:serviceaccount:nats-east:jetstream-controller",
+		},
+		{
+			name:     "no-override-no-env-falls-back-to-default",
+			override: "",
+			getenv:   envWith(""),
+			want:     DefaultControllerServiceAccount,
+		},
+		{
+			name:     "nil-getenv-falls-back-to-default",
+			override: "",
+			getenv:   nil,
+			want:     DefaultControllerServiceAccount,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, ResolveControllerServiceAccount(tc.override, tc.getenv))
+		})
+	}
 }
 
 // --- ValidateDelete matrix ---------------------------------------------
@@ -539,6 +691,63 @@ func TestStreamValidator_NoDrill_NoUserCheck(t *testing.T) {
 	require.Contains(t, err.Error(), "sibling-conflict webhook")
 	require.NotContains(t, err.Error(), "drill-active operator-only gate",
 		"gate must NOT fire outside a drill window")
+}
+
+// TestStreamValidator_DrillActiveOperatorGate_AllowsControllerSelf is the
+// validator-level regression for the 2026-05-31 deadlock: nack's own
+// controller UPDATE (finalizer strip) on a scope-labeled Stream during a
+// drill must pass the gate. The validator's ControllerSelfSA defaults to
+// DefaultControllerServiceAccount when unset, so we set it explicitly here
+// to the canonical value (mirrors the wired-up production default).
+func TestStreamValidator_DrillActiveOperatorGate_AllowsControllerSelf(t *testing.T) {
+	existing := newStream("orders-primary", "ORDERS", nil)
+	c := newFakeClient(t,
+		newNamespace(testNS, "drill-2026-05-31-xyz"),
+		existing,
+	)
+	v := &StreamValidator{Client: c, ControllerSelfSA: DefaultControllerServiceAccount}
+
+	self := scopedStream("orders-mirror", "ORDERS")
+	self.Spec.Mirror = &api.StreamSource{Name: "ORDERS"}
+	ctx := ctxWithUser(DefaultControllerServiceAccount)
+
+	warnings, err := v.ValidateUpdate(ctx, existing, self)
+	require.NoError(t, err,
+		"controller-self SA must pass the gate so nack can manage its own CRs/finalizers mid-drill")
+	// sibling-conflict legacy allow-during-drill warning still fires.
+	require.NotEmpty(t, warnings)
+}
+
+// TestStreamValidator_DrillScopeControllerSelf_DeleteAllows pins the DELETE
+// path: when nack reconciles the operator's CR deletion, the finalizer-strip
+// happens via an UPDATE, but the controller may also issue DELETE-adjacent
+// calls; the gate must not block the controller SA on DELETE either.
+func TestStreamValidator_DrillScopeControllerSelf_DeleteAllows(t *testing.T) {
+	c := newFakeClient(t, newNamespace(testNS, "drill-2026-05-31-xyz"))
+	v := &StreamValidator{Client: c, ControllerSelfSA: DefaultControllerServiceAccount}
+	self := scopedStream("orders-primary", "ORDERS")
+
+	ctx := ctxWithUser(DefaultControllerServiceAccount)
+	_, err := v.ValidateDelete(ctx, self)
+	require.NoError(t, err, "controller-self SA DELETE on scope-labeled CR must be allowed mid-drill")
+}
+
+// TestKeyValueValidator_DrillActiveOperatorGate_AllowsControllerSelf is the
+// KeyValue analogue of the Stream controller-self allow test.
+func TestKeyValueValidator_DrillActiveOperatorGate_AllowsControllerSelf(t *testing.T) {
+	existing := newKV("config-primary", "CONFIG")
+	c := newFakeClient(t,
+		newNamespace(testNS, "drill-2026-05-31-xyz"),
+		existing,
+	)
+	v := &KeyValueValidator{Client: c, ControllerSelfSA: DefaultControllerServiceAccount}
+
+	self := scopedKV("config-mirror", "CONFIG")
+	ctx := ctxWithUser(DefaultControllerServiceAccount)
+
+	warnings, err := v.ValidateUpdate(ctx, existing, self)
+	require.NoError(t, err, "controller-self SA must pass the gate on KV CRs too")
+	require.NotEmpty(t, warnings)
 }
 
 // --- sanity wires (defensive imports) ----------------------------------

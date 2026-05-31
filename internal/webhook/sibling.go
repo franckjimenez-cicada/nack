@@ -244,6 +244,15 @@ type StreamValidator struct {
 	// falls back to DefaultDRPOperatorServiceAccount via the gate. Wired
 	// at boot from the --drp-operator-sa flag in cmd/jetstream-controller.
 	DRPOperatorSA string
+	// ControllerSelfSA is nack's OWN controller ServiceAccount username,
+	// ALWAYS exempt from the drill-active gate so the controller can manage
+	// its own CRs/finalizers even mid-drill (without this, finalizer removal
+	// on a CR the operator is deleting is rejected and the CR sticks in
+	// Terminating — the live 2026-05-31 deadlock). Empty falls back to
+	// DefaultControllerServiceAccount via the gate. Wired at boot from the
+	// --self-service-account flag (auto-detected namespace) in
+	// cmd/jetstream-controller.
+	ControllerSelfSA string
 	// DefaultAccount is the NATS account an UNLABELED CR resolves to when
 	// comparing siblings (chart entries that omit `account` are the implicit
 	// default account). Empty falls back to DefaultNATSAccount ("JS"). Wired
@@ -271,7 +280,7 @@ func (v *StreamValidator) ValidateUpdate(ctx context.Context, _ *api.Stream, obj
 // operator SA, the gate is a no-op and delete proceeds — preserving the
 // upstream "no-op delete validator" behavior for the common case.
 func (v *StreamValidator) ValidateDelete(ctx context.Context, obj *api.Stream) (admission.Warnings, error) {
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA, v.ControllerSelfSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("Stream", obj.Name, denyReason)
@@ -284,7 +293,7 @@ func (v *StreamValidator) validate(ctx context.Context, obj *api.Stream) (admiss
 	// Runs FIRST so a denied request never burns the sibling-list cost.
 	// See drill_active_gate.go's header for the full rationale (live failure
 	// 2026-05-29 on the E→W flip; 7/17 streams failed promote).
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA, v.ControllerSelfSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("Stream", obj.Name, denyReason)
@@ -323,6 +332,8 @@ type KeyValueValidator struct {
 	Client ctrlclient.Client
 	// DRPOperatorSA — see StreamValidator.DRPOperatorSA. Same semantics.
 	DRPOperatorSA string
+	// ControllerSelfSA — see StreamValidator.ControllerSelfSA. Same semantics.
+	ControllerSelfSA string
 	// DefaultAccount — see StreamValidator.DefaultAccount. Same semantics.
 	DefaultAccount string
 }
@@ -340,7 +351,7 @@ func (v *KeyValueValidator) ValidateUpdate(ctx context.Context, _ *api.KeyValue,
 // ValidateDelete applies the operator-only gate on DELETE — see
 // StreamValidator.ValidateDelete for the rationale.
 func (v *KeyValueValidator) ValidateDelete(ctx context.Context, obj *api.KeyValue) (admission.Warnings, error) {
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA, v.ControllerSelfSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("KeyValue", obj.Name, denyReason)
@@ -351,7 +362,7 @@ func (v *KeyValueValidator) ValidateDelete(ctx context.Context, obj *api.KeyValu
 func (v *KeyValueValidator) validate(ctx context.Context, obj *api.KeyValue) (admission.Warnings, error) {
 	// Step 1: operator-only gate — same rationale as StreamValidator. See
 	// drill_active_gate.go header for the live failure context.
-	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA); err != nil {
+	if allowed, _, denyReason, err := drillActiveOperatorGate(ctx, v.Client, obj, v.DRPOperatorSA, v.ControllerSelfSA); err != nil {
 		return nil, err
 	} else if !allowed {
 		return nil, formatOperatorOnlyRejection("KeyValue", obj.Name, denyReason)

@@ -54,11 +54,37 @@ limitations under the License.
 //
 // Why operator-only (not just "non-ArgoCD-only"): the gate is positive,
 // not negative. We don't enumerate the set of bad actors (ArgoCD, manual
-// kubectl, dashboard auto-reconciler, etc.); we name the SINGLE writer that
-// is allowed during a drill and reject everyone else. This is the minimum-
+// kubectl, dashboard auto-reconciler, etc.); we name the writers that
+// are allowed during a drill and reject everyone else. This is the minimum-
 // privilege shape: anything new that tries to write a scope-labeled CR
 // during a drill (CI bots, helm operators, GitOps tooling) is rejected by
-// default. The operator's username is the ONE thing we trust.
+// default. We trust exactly two identities:
+//
+//	(1) the drp-operator SA — the orchestrator driving the promote/demote
+//	    delete+create cycle, and
+//	(2) nack's OWN controller SA — `jetstream-controller`. nack must be
+//	    able to manage its own CRs at all times, including REMOVING the
+//	    finalizer on a Stream/KeyValue CR it is deleting on the operator's
+//	    behalf.
+//
+// Why (2) is mandatory — live deadlock 2026-05-31 (E→W flip):
+// drp-operator's promote path deletes a scope-labeled Stream/KV CR. nack
+// reconciles the deletion: it deletes the server-side stream, then issues
+// an UPDATE to strip its own finalizer so the CR can leave Terminating.
+// That UPDATE comes from `system:serviceaccount:nats:jetstream-controller`
+// — NOT the operator SA — so the original gate REJECTED it:
+//
+//	delete stream: remove finalizer: admission webhook ... denied the
+//	request: ... rejected by drill-active operator-only gate:
+//	user="system:serviceaccount:nats:jetstream-controller" drill-active="true"
+//
+// Result: the CR is stuck in Terminating forever, the operator's
+// "wait-gone" polling times out, and the drill fails. The operator's
+// demote side was fixed to stop deleting CRs (passive-role translation,
+// PR #8), but the PROMOTE side still delete-recreates CRs with
+// drill-active set — so this deadlock WILL recur on the destination region
+// each flip unless nack stops blocking its own controller. Exempting the
+// controller SA is the required paired change for that promote path.
 //
 // Coordination with the existing sibling-conflict path: the operator-only
 // gate runs FIRST. If the gate rejects, validation returns immediately —
@@ -121,13 +147,84 @@ const DefaultDRPOperatorServiceAccount = "system:serviceaccount:nats:drp-operato
 // the per-validator configured field rather than this package-level value.
 const DRPOperatorServiceAccount = DefaultDRPOperatorServiceAccount
 
+// DefaultControllerNamespace / DefaultControllerSAName are the namespace and
+// ServiceAccount-name components nack's own controller runs under by
+// convention in dev/stg. The chart's `jsc.serviceAccountName` helper
+// defaults the SA name to "jetstream-controller", and the nacks ArgoCD
+// Application deploys into the `nats` namespace
+// (apps-platform/dev-west/nacks.yaml: destination.namespace=nats). Combined,
+// the conventional self-identity is
+// `system:serviceaccount:nats:jetstream-controller`.
+//
+// These are kept as separate components (not just a baked full string) so
+// ResolveControllerServiceAccount can swap in the ACTUAL runtime namespace
+// from the downward-API `POD_NAMESPACE` env, making the default correct even
+// in clusters that deploy nack into a non-`nats` namespace without anyone
+// having to set the override flag.
+const (
+	DefaultControllerNamespace = "nats"
+	DefaultControllerSAName    = "jetstream-controller"
+)
+
+// DefaultControllerServiceAccount is the canonical self-identity of nack's
+// own controller: the SA whose finalizer-stripping UPDATEs the gate MUST
+// always allow so nack can manage its own CRs even mid-drill. Format matches
+// admission.Request.UserInfo.Username for in-cluster ServiceAccount requests.
+//
+// Confirmed against the deployed dev-west chart: SA name is the chart
+// default `jetstream-controller` (children/nacks/chart values
+// serviceAccountName="" → `jsc.serviceAccountName` default), namespace is
+// `nats` (children/nacks deployment release namespace == the nacks ArgoCD
+// Application destination namespace). See ResolveControllerServiceAccount
+// for the runtime auto-detection that keeps this correct across namespaces.
+const DefaultControllerServiceAccount = "system:serviceaccount:" +
+	DefaultControllerNamespace + ":" + DefaultControllerSAName
+
+// PodNamespaceEnv is the downward-API environment variable the deployment
+// already exposes (deployment-jetstream-controller.yml sets POD_NAMESPACE
+// from fieldRef metadata.namespace). ResolveControllerServiceAccount reads
+// it to pin the controller-self SA's namespace component to wherever nack
+// actually runs, without depending on a hardcoded namespace.
+const PodNamespaceEnv = "POD_NAMESPACE"
+
+// ResolveControllerServiceAccount returns the self-identity SA username the
+// gate must always exempt, in priority order:
+//
+//	1. an explicit override (the --self-service-account flag value), when
+//	   non-empty — used for clusters that rename the SA;
+//	2. otherwise the conventional SA name (DefaultControllerSAName) under the
+//	   namespace nack is actually running in, auto-detected from the
+//	   downward-API POD_NAMESPACE env;
+//	3. otherwise the fully-baked DefaultControllerServiceAccount.
+//
+// This is robust to the namespace differing across clusters (the most
+// common real-world variance) while keeping the dev/stg default exactly
+// `system:serviceaccount:nats:jetstream-controller`. The SA NAME is treated
+// as conventional/pinned (the chart default never changes per-cluster);
+// only the namespace is environment-derived. A cluster that renames the SA
+// itself must set the override flag.
+//
+// getenv is injected for testability; pass os.Getenv in production.
+func ResolveControllerServiceAccount(override string, getenv func(string) string) string {
+	if override != "" {
+		return override
+	}
+	if getenv != nil {
+		if ns := getenv(PodNamespaceEnv); ns != "" {
+			return "system:serviceaccount:" + ns + ":" + DefaultControllerSAName
+		}
+	}
+	return DefaultControllerServiceAccount
+}
+
 // operatorOnlyRemediationHint is the message tail returned alongside every
 // operator-only rejection. The first sentence names the rule; the second
 // gives the operator-friendly recovery action (wait for drill-active to
 // clear); the third gives the test-only escape hatch.
 const operatorOnlyRemediationHint = "Stream/KeyValue updates on scope-labeled CRs are blocked during a DRP drill " +
 	"(namespace annotation '" + DrillActiveAnnotation + "' is set). " +
-	"Only the drp-operator ServiceAccount may mutate these CRs while a drill is in flight. " +
+	"Only the drp-operator ServiceAccount and nack's own controller ServiceAccount " +
+	"(which must be able to manage its own CRs/finalizers) may mutate these CRs while a drill is in flight. " +
 	"The request will succeed automatically once the drill completes and clears the annotation. " +
 	"If you're testing locally without a real drill, remove the '" + DrillActiveAnnotation + "' annotation from the namespace."
 
@@ -160,14 +257,23 @@ type objectLabels interface {
 // substitutes DefaultDRPOperatorServiceAccount so callers that haven't yet
 // migrated to the flag don't accidentally allow EVERYONE through.
 //
+// `selfSA` is nack's OWN controller ServiceAccount username. It is ALWAYS
+// exempt so nack can manage its own CRs/finalizers/reconciles even while a
+// drill is in flight — see this file's header for the live finalizer-
+// removal deadlock that mandates this. When empty, the gate substitutes
+// DefaultControllerServiceAccount for the same belt-and-suspenders reason
+// as operatorSA. (The caller normally passes the value of
+// ResolveControllerServiceAccount, which auto-detects the namespace.)
+//
 // Decision matrix (in order — first match wins):
 //
-//	| drill-active | scope-labeled | requester  | result   |
-//	|--------------|---------------|------------|----------|
-//	| no           | *             | *          | allowed  |
-//	| yes          | no            | *          | allowed  |
-//	| yes          | yes           | operator   | allowed  |
-//	| yes          | yes           | other      | REJECT   |
+//	| drill-active | scope-labeled | requester       | result   |
+//	|--------------|---------------|-----------------|----------|
+//	| no           | *             | *               | allowed  |
+//	| yes          | no            | *               | allowed  |
+//	| yes          | yes           | operator SA     | allowed  |
+//	| yes          | yes           | controller self | allowed  |
+//	| yes          | yes           | other           | REJECT   |
 //
 // `requester` comes from the AdmissionReview's `request.userInfo.username`
 // surfaced via admission.RequestFromContext (controller-runtime threads it
@@ -175,9 +281,12 @@ type objectLabels interface {
 // (unit-test path), we treat the requester as the operator — tests that
 // want to exercise the rejection path set up the request explicitly via
 // admission.NewContextWithRequest.
-func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objectLabels, operatorSA string) (allowed bool, drillID, denyReason string, err error) {
+func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objectLabels, operatorSA, selfSA string) (allowed bool, drillID, denyReason string, err error) {
 	if operatorSA == "" {
 		operatorSA = DefaultDRPOperatorServiceAccount
+	}
+	if selfSA == "" {
+		selfSA = DefaultControllerServiceAccount
 	}
 	// Step 1: namespace drill-active? Cheap to check first because the
 	// vast majority of admission calls outside drill windows skip the
@@ -212,6 +321,13 @@ func drillActiveOperatorGate(ctx context.Context, c ctrlclient.Client, obj objec
 		return true, id, "", nil
 	}
 	if username == operatorSA {
+		return true, id, "", nil
+	}
+	// nack's own controller must always be able to manage its own CRs —
+	// including stripping its finalizer on a CR the operator is deleting
+	// through nack. Without this, the controller's finalizer-removal UPDATE
+	// is rejected and the CR is stuck in Terminating forever (see header).
+	if username == selfSA {
 		return true, id, "", nil
 	}
 
