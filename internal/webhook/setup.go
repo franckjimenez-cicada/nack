@@ -35,6 +35,15 @@ type Options struct {
 	// back to DefaultDRPOperatorServiceAccount.
 	DRPOperatorSA string
 
+	// ControllerSelfSA is nack's OWN controller ServiceAccount username,
+	// always exempt from the drill-active gate so the controller can manage
+	// its own CRs/finalizers even mid-drill. Format
+	// `system:serviceaccount:<ns>:<sa>`. Empty falls back to
+	// DefaultControllerServiceAccount. Callers normally pass the result of
+	// ResolveControllerServiceAccount (flag override + POD_NAMESPACE auto-
+	// detection).
+	ControllerSelfSA string
+
 	// DefaultAccount is the NATS account an unlabeled Stream/KeyValue CR
 	// resolves to during the account-aware sibling-conflict comparison.
 	// Empty falls back to webhook.DefaultNATSAccount ("JS").
@@ -61,17 +70,19 @@ func SetupWithManager(mgr ctrl.Manager, opts Options) error {
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-stream",
 		admission.WithValidator[*api.Stream](scheme, &StreamValidator{
-			Client:         mgr.GetClient(),
-			DRPOperatorSA:  opts.DRPOperatorSA,
-			DefaultAccount: opts.DefaultAccount,
+			Client:           mgr.GetClient(),
+			DRPOperatorSA:    opts.DRPOperatorSA,
+			ControllerSelfSA: opts.ControllerSelfSA,
+			DefaultAccount:   opts.DefaultAccount,
 		}),
 	)
 	srv.Register(
 		"/validate-jetstream-nats-io-v1beta2-keyvalue",
 		admission.WithValidator[*api.KeyValue](scheme, &KeyValueValidator{
-			Client:         mgr.GetClient(),
-			DRPOperatorSA:  opts.DRPOperatorSA,
-			DefaultAccount: opts.DefaultAccount,
+			Client:           mgr.GetClient(),
+			DRPOperatorSA:    opts.DRPOperatorSA,
+			ControllerSelfSA: opts.ControllerSelfSA,
+			DefaultAccount:   opts.DefaultAccount,
 		}),
 	)
 

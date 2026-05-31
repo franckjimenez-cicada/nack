@@ -96,6 +96,8 @@ func run() error {
 	backupConfirmedAnnotation := flag.String("backup-confirmed-annotation", "drp.cicada.io/backup-confirmed-generation", "Annotation key the controller reads to know an external backup operator has captured the CR's local state. Value must equal the CR's metadata.generation as a decimal string.")
 	drpOperatorSA := flag.String("drp-operator-sa", webhook.DefaultDRPOperatorServiceAccount,
 		"ServiceAccount username (format `system:serviceaccount:<ns>:<sa>`) allowed to mutate scope-labeled Stream/KeyValue CRs while the namespace carries the drill-active annotation. Defaults to the dev/stg convention; override for prod or other environments where drp-operator runs under a different namespace/SA.")
+	selfServiceAccount := flag.String("self-service-account", "",
+		"ServiceAccount username (format `system:serviceaccount:<ns>:<sa>`) of nack's OWN controller, ALWAYS exempt from the drill-active operator-only gate so the controller can manage its own CRs/finalizers even mid-drill (prevents the finalizer-removal deadlock that leaves CRs stuck Terminating during a promote). Empty (default) auto-detects: the conventional SA name `jetstream-controller` under the namespace from the POD_NAMESPACE downward-API env, falling back to `system:serviceaccount:nats:jetstream-controller`. Set explicitly only if your cluster renames the controller SA.")
 	defaultAccount := flag.String("default-account", webhook.DefaultNATSAccount,
 		"NATS account name an UNLABELED Stream/KeyValue CR resolves to in the account-aware sibling-conflict webhook. Chart entries that omit `account` are the implicit default account; with this flag an unlabeled CR (e.g. a JS stream) no longer collides with a labeled non-default sibling (e.g. its nats-qa twin sharing the same spec.name). Defaults to the canonical default account.")
 	enablePassiveRoleTranslation := flag.Bool("enable-passive-role-translation", false,
@@ -152,6 +154,7 @@ func run() error {
 			CrossRegionNATSCredsPath:     *crossRegionNATSCredsPath,
 			BackupConfirmedAnnotation:    *backupConfirmedAnnotation,
 			DRPOperatorSA:                *drpOperatorSA,
+			ControllerSelfSA:             webhook.ResolveControllerServiceAccount(*selfServiceAccount, os.Getenv),
 			DefaultAccount:               *defaultAccount,
 			EnablePassiveRoleTranslation: *enablePassiveRoleTranslation,
 			CrossRegionNATSDomain:        *crossRegionNATSDomain,
@@ -280,13 +283,14 @@ func runControlLoop(config *rest.Config, natsCfg *controller.NatsConfig, control
 
 	if controllerCfg.EnableSiblingWebhook {
 		if err := webhook.SetupWithManager(mgr, webhook.Options{
-			DRPOperatorSA:  controllerCfg.DRPOperatorSA,
-			DefaultAccount: controllerCfg.DefaultAccount,
+			DRPOperatorSA:    controllerCfg.DRPOperatorSA,
+			ControllerSelfSA: controllerCfg.ControllerSelfSA,
+			DefaultAccount:   controllerCfg.DefaultAccount,
 		}); err != nil {
 			return fmt.Errorf("register sibling-conflict webhook: %w", err)
 		}
-		klog.Infof("sibling-conflict admission webhook enabled (drp-operator SA: %q)",
-			controllerCfg.DRPOperatorSA)
+		klog.Infof("sibling-conflict admission webhook enabled (drp-operator SA: %q, controller self SA: %q)",
+			controllerCfg.DRPOperatorSA, controllerCfg.ControllerSelfSA)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

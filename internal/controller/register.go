@@ -81,6 +81,16 @@ type Config struct {
 	// webhook.DefaultDRPOperatorServiceAccount.
 	DRPOperatorSA string
 
+	// ControllerSelfSA is nack's OWN controller ServiceAccount username,
+	// ALWAYS exempt from the drill-active operator-only gate so the
+	// controller can manage its own CRs/finalizers/reconciles even while a
+	// drill is in flight (without it, finalizer removal on a CR the operator
+	// is deleting through nack is rejected and the CR sticks in Terminating —
+	// the live 2026-05-31 deadlock). Format `system:serviceaccount:<ns>:<sa>`.
+	// Empty falls back to webhook.DefaultControllerServiceAccount. Wired at
+	// boot from --self-service-account with POD_NAMESPACE auto-detection.
+	ControllerSelfSA string
+
 	// DefaultAccount is the NATS account an UNLABELED Stream/KeyValue CR
 	// resolves to in the account-aware sibling-conflict comparison. Chart
 	// entries that omit `account` are the implicit default account; an
