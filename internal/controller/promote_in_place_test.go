@@ -100,6 +100,101 @@ func Test_streamSpecToConfig_clearsMirrorWhenSpecPrimary(t *testing.T) {
 	assert.Equal(t, []string{"promoted.>"}, cfg.Subjects, "promote targetConfig must set the authored subjects")
 }
 
+// Test_shouldConvertActiveRole_gating pins the ACTIVE-role-translation
+// predicate: it fires ONLY for a scope-labeled, primary-form CR whose server
+// stream is currently a mirror, on an ACTIVE (or role-absent) namespace.
+func Test_shouldConvertActiveRole_gating(t *testing.T) {
+	// Happy: scope-labeled, active (""=active default), spec primary, server mirror.
+	assert.True(t, shouldConvertActiveRole(true, "", false, true),
+		"scope + active(default) + spec-primary + server-mirror must convert")
+	assert.True(t, shouldConvertActiveRole(true, localRoleActive, false, true),
+		"explicit active must convert")
+
+	// Negatives — each gate independently blocks.
+	assert.False(t, shouldConvertActiveRole(false, localRoleActive, false, true),
+		"NON-scope-labeled primary must NEVER be touched (steady-state primary safety)")
+	assert.False(t, shouldConvertActiveRole(true, localRolePassive, false, true),
+		"passive role is the passive path's job — active-translation must not fire")
+	assert.False(t, shouldConvertActiveRole(true, localRoleActive, true, true),
+		"spec is mirror form — active-translation never creates a mirror")
+	assert.False(t, shouldConvertActiveRole(true, localRoleActive, false, false),
+		"server already primary — nothing to convert (steady state)")
+}
+
+// Test_activeRoleTranslation_convertsMirrorToPrimaryInPlace is the
+// ACTIVE-role-translation analog of Test_streamPromoteInPlace_preservesMessages,
+// driven against the real embedded nats-server (v2.14.0, pinned by go.mod).
+//
+// It reproduces the failed-promote scenario the fork now fixes: under passive-
+// role-translation the scope CR is ALWAYS primary-form, so when the namespace
+// flips to local-role=active the reconciler must (a) recognize via
+// shouldConvertActiveRole that the SERVER stream is still a mirror, and (b)
+// convert it to a PRIMARY IN PLACE using the SAME PR #11 mechanism
+// (streamSpecToConfig emitting an explicit Mirror=nil + UpdateConfiguration on
+// the live serverState). The conversion must RETAIN every replicated message
+// and set the authored subjects.
+func Test_activeRoleTranslation_convertsMirrorToPrimaryInPlace(t *testing.T) {
+	mgr, js, cleanup := newJSTestServer(t)
+	defer cleanup()
+
+	const nMsgs = 17
+
+	// Origin primary with messages, replicated into a mirror DST — the
+	// passive-side steady state before the active flip.
+	_, err := js.AddStream(&nats.StreamConfig{Name: "ORIGIN", Subjects: []string{"act.>"}, Storage: nats.FileStorage})
+	require.NoError(t, err)
+	for i := 0; i < nMsgs; i++ {
+		_, perr := js.Publish("act.evt", []byte("payload"))
+		require.NoError(t, perr)
+	}
+	_, err = js.AddStream(&nats.StreamConfig{Name: "DST", Mirror: &nats.StreamSource{Name: "ORIGIN"}, Storage: nats.FileStorage})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		info, e := js.StreamInfo("DST")
+		return e == nil && info.State.Msgs == nMsgs
+	}, 5*time.Second, 100*time.Millisecond, "mirror must replicate all messages before the active flip")
+
+	beforeInfo, err := js.StreamInfo("DST")
+	require.NoError(t, err)
+	createdBefore := beforeInfo.Created
+
+	// GATE: simulate the active-role decision the reconciler makes. The CR is
+	// scope-labeled + primary-form; the namespace is active; the server is a
+	// mirror. shouldConvertActiveRole MUST say "convert".
+	serverIsMirror := beforeInfo.Config.Mirror != nil
+	require.True(t, serverIsMirror, "precondition: DST is a server-side mirror before the flip")
+	specHasMirror := false // primary-form scope CR (passive-translation steady state)
+	require.True(t,
+		shouldConvertActiveRole(true /*scope-labeled*/, localRoleActive, specHasMirror, serverIsMirror),
+		"active-translation gate must fire for this scope mirror under active role")
+
+	// Source releases its subjects first (DemotingSource ran), so the in-place
+	// promote does not hit 10065. (The 10065 retryable path is covered by
+	// Test_streamPromoteInPlace_subjectOverlapIsRetryableNotDestructive.)
+	require.NoError(t, mgr.DeleteStream("ORIGIN"))
+
+	// CONVERT IN PLACE — the exact code path the active gate routes into:
+	// streamSpecToConfig on the primary spec (emits explicit Mirror=nil),
+	// then UpdateConfiguration on the live server (mirror) state.
+	dst, err := mgr.LoadStream("DST")
+	require.NoError(t, err)
+	serverCfg := dst.Configuration()
+	spec := &api.StreamSpec{Name: "DST", Subjects: []string{"act.>"}}
+	opts, err := streamSpecToConfig(spec, &serverCfg)
+	require.NoError(t, err)
+	require.NoError(t, dst.UpdateConfiguration(serverCfg, opts...),
+		"active-role in-place mirror→primary conversion must be accepted by nats-server")
+
+	// Assertions: data retained, stream identity preserved, now primary.
+	afterInfo, err := js.StreamInfo("DST")
+	require.NoError(t, err)
+	assert.EqualValues(t, nMsgs, afterInfo.State.Msgs, "ALL messages must survive the in-place active-role conversion")
+	assert.Nil(t, afterInfo.Config.Mirror, "DST must be PRIMARY-form (Mirror==nil) after active-role translation")
+	assert.Equal(t, []string{"act.>"}, afterInfo.Config.Subjects, "DST must own the authored subjects after conversion")
+	assert.Equal(t, createdBefore, afterInfo.Created, "server stream must be the SAME stream (Created unchanged) — never delete+recreated")
+	assert.EqualValues(t, 1, afterInfo.State.FirstSeq, "first sequence preserved — not a fresh seq-0 epoch")
+}
+
 // Test_streamPromoteInPlace_preservesMessages drives the REAL data-plane path:
 // it builds an origin stream with messages, a mirror that replicates them, then
 // performs the exact in-place conversion the reconciler now performs

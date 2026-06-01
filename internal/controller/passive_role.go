@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
 	corev1 "k8s.io/api/core/v1"
@@ -82,6 +83,66 @@ func shouldTranslatePassiveRole(ctx context.Context, g passiveRoleGate, namespac
 		return false, role, nil
 	}
 	return role == localRolePassive, role, nil
+}
+
+// scopeLabel is the label key that marks a Stream / KeyValue CR as
+// participating in DRP cross-region failover. Mirrors
+// webhook.ScopeLabel (kept as a separate const here to avoid the
+// controller package importing the webhook package). ACTIVE-role
+// translation (the inverse of passive translation) only ever fires on
+// CRs carrying this label with a non-empty value, so steady-state
+// primaries in non-DRP namespaces are never touched.
+const scopeLabel = "drp.cicada.io/nats-failover-scope"
+
+// isScopeLabeled reports whether the CR carries a non-empty
+// drp.cicada.io/nats-failover-scope label. ACTIVE-role translation is
+// strictly gated on this so it only operates on the DRP-managed scope
+// set (the same set the operator demote/promote enumerates), never an
+// arbitrary primary.
+func isScopeLabeled(labels map[string]string) bool {
+	return strings.TrimSpace(labels[scopeLabel]) != ""
+}
+
+// shouldConvertActiveRole reports whether the reconciler should perform
+// an ACTIVE-role-translation IN-PLACE promote of this CR: convert a
+// server-side MIRROR back to a PRIMARY (drop Mirror, set authored
+// subjects) WITHOUT deleting the stream, preserving all replicated
+// messages.
+//
+// This is the INVERSE of passive-role translation (fork PR #8 converts a
+// primary-form CR → server mirror when local-role=passive). PR #8 had no
+// inverse: when local-role flips back to active, nothing converted an
+// existing server mirror back to a primary, so the drp-operator promote
+// (which under passive-translation finds the CRs already primary-form and
+// mutates nothing) established NO primary — both regions stayed server-
+// side mirrors. This predicate closes that gap.
+//
+// Fires only when ALL hold:
+//   - The CR is scope-labeled (drp.cicada.io/nats-failover-scope set).
+//   - The namespace local-role is NOT passive (active, or absent =
+//     active default — a cluster with no role declared serves its
+//     authored primaries).
+//   - The authored (effective) spec is PRIMARY form (Mirror == nil):
+//     active-translation never creates a mirror, it only un-does one.
+//   - The SERVER stream is currently a MIRROR (serverIsMirror): there is
+//     a mirror to convert. A server already-primary is the steady state
+//     and is left untouched (the normal update path converges it).
+//
+// effectiveSpecHasMirror is the post-passive-translation spec's Mirror
+// presence; when local-role=passive the passive path already handles the
+// CR and this predicate must not also fire (it won't — localRole==passive
+// fails the role gate).
+func shouldConvertActiveRole(scopeLabeled bool, localRole string, effectiveSpecHasMirror, serverIsMirror bool) bool {
+	if !scopeLabeled {
+		return false
+	}
+	if localRole == localRolePassive {
+		return false
+	}
+	if effectiveSpecHasMirror {
+		return false
+	}
+	return serverIsMirror
 }
 
 // passiveRoleGuardMsg builds the operator-facing message attached to
