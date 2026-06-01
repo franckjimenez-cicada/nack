@@ -125,14 +125,31 @@ func (c *Controller) processStreamObject(str *apis.Stream, jsm jsmClientFunc) (e
 		}
 		c.normalEvent(str, "Updating", fmt.Sprintf("Updating stream %q", spec.Name))
 		if updErr := natsClientUtil(updateStream); updErr != nil {
+			// DATA-LOSS GUARD (promote fix): a subject-overlap (10065) means the
+			// destination is claiming subjects the source still owns (the source
+			// has not demoted yet). It is a TRANSIENT ORDERING condition, NOT a
+			// mirror-flip incompatibility — surface it as a retryable error so
+			// the next reconcile re-attempts the in-place update once the source
+			// releases the subjects. Force-deleting here would destroy the data.
+			if isSubjectOverlapStreamErr(updErr) {
+				return fmt.Errorf("in-place promote of stream %q blocked by subject overlap (10065): source not yet demoted; retrying without destroying data: %w", spec.Name, updErr)
+			}
 			// Reactive recreate: when the NATS server rejects the in-place
 			// update because the requested change would flip the stream
 			// between source-mode and mirror-mode, the only correct path is
 			// to delete the server stream and recreate it from the spec.
 			// Opt-in via --mirror-recreate-on-conflict.
-			if c.opts.MirrorRecreateOnConflict && isMirrorIncompatibleStreamErr(updErr) {
+			//
+			// NEVER take the destructive branch for a mirror→primary promote
+			// (spec.Mirror == nil): that direction is achievable in place (the
+			// fresh config built by updateStream already has Mirror=nil, so the
+			// in-place UpdateConfiguration drops it and RETAINS the messages —
+			// verified against nats-server v2.14.0). Deleting would drop the
+			// server stream + all data. Only the genuinely-impossible
+			// primary→mirror direction (spec.Mirror != nil) may recreate.
+			if c.opts.MirrorRecreateOnConflict && isMirrorIncompatibleStreamErr(updErr) && spec.Mirror != nil {
 				c.normalEvent(str, "RecreatingOnMirrorFlip",
-					fmt.Sprintf("Update of stream %q rejected by NATS as mirror-incompatible; force-recreating.", spec.Name),
+					fmt.Sprintf("Update of stream %q rejected by NATS as mirror-incompatible (primary→mirror); force-recreating.", spec.Name),
 				)
 				if delErr := natsClientUtil(deleteStream); delErr != nil {
 					return fmt.Errorf("force-delete after mirror-incompatible update: %w", delErr)
@@ -695,6 +712,11 @@ const (
 	jsStreamMirrorWithSourcesErr  uint16 = 10031
 	jsStreamMirrorWithSubjectsErr uint16 = 10034
 	jsStreamMirrorInvalidErr      uint16 = 10055
+	// jsStreamSubjectOverlapErr — the destination's subjects overlap another
+	// existing stream (the source that has not released them yet). Transient
+	// during a promote; MUST NOT trigger a destructive recreate. See the
+	// internal/controller JSStreamSubjectOverlapErr doc for the full rationale.
+	jsStreamSubjectOverlapErr uint16 = 10065
 )
 
 // isMirrorIncompatibleStreamErr unwraps the chain looking for a NATS API
@@ -712,4 +734,18 @@ func isMirrorIncompatibleStreamErr(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isSubjectOverlapStreamErr reports whether err is the NATS subject-overlap
+// rejection (10065). Used to keep a transient promote-ordering overlap off the
+// destructive delete+recreate path.
+func isSubjectOverlapStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apierr jsmapi.ApiError
+	if !errors.As(err, &apierr) {
+		return false
+	}
+	return apierr.NatsErrorCode() == jsStreamSubjectOverlapErr
 }

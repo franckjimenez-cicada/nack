@@ -321,3 +321,38 @@ func TestProcessStream(t *testing.T) {
 		}
 	})
 }
+
+// TestStreamErrorClassifiers locks in the promote-fix error routing in the
+// legacy controller: a subject-overlap (10065) is classified as overlap (and
+// NOT as a mirror-flip incompatibility), so a mirror→primary promote that races
+// the source's subject release surfaces a retryable error instead of taking the
+// destructive delete+recreate path. The genuine mirror-flip codes
+// (10031/10034/10055) remain mirror-incompatible.
+func TestStreamErrorClassifiers(t *testing.T) {
+	t.Parallel()
+
+	overlap := jsmapi.ApiError{Code: 400, ErrCode: jsStreamSubjectOverlapErr}
+	if !isSubjectOverlapStreamErr(overlap) {
+		t.Error("10065 must classify as subject-overlap")
+	}
+	if isMirrorIncompatibleStreamErr(overlap) {
+		t.Error("10065 must NOT classify as mirror-incompatible (would trigger destructive recreate)")
+	}
+
+	for _, code := range []uint16{jsStreamMirrorWithSourcesErr, jsStreamMirrorWithSubjectsErr, jsStreamMirrorInvalidErr} {
+		mirr := jsmapi.ApiError{Code: 400, ErrCode: code}
+		if !isMirrorIncompatibleStreamErr(mirr) {
+			t.Errorf("%d must classify as mirror-incompatible", code)
+		}
+		if isSubjectOverlapStreamErr(mirr) {
+			t.Errorf("%d must NOT classify as subject-overlap", code)
+		}
+	}
+
+	if isSubjectOverlapStreamErr(errors.New("plain")) || isMirrorIncompatibleStreamErr(errors.New("plain")) {
+		t.Error("non-API errors must classify as neither")
+	}
+	if isSubjectOverlapStreamErr(nil) || isMirrorIncompatibleStreamErr(nil) {
+		t.Error("nil must classify as neither")
+	}
+}

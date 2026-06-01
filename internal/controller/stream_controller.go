@@ -285,28 +285,53 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				)
 				return nil
 			}
-			gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
-			if gateErr != nil {
-				return fmt.Errorf("evaluate backup gate: %w", gateErr)
-			}
-			if gateFires {
-				log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
-					"reason", reason, "message", msg,
+			// DATA-PRESERVING mirror→primary promote (the data-loss fix).
+			// When the server stream is a mirror and the effective spec drops
+			// the mirror to become a primary, this is the DRP promote. It is
+			// achievable IN PLACE (drop Mirror + set Subjects via
+			// UpdateConfiguration) on nats-server WITHOUT deleting the server
+			// stream, so the replicated messages survive. Do NOT take the
+			// destructive delete branch here: fall through to the normal
+			// update path below, which now emits an explicit Mirror=nil opt
+			// (see streamSpecToConfig) so the in-place update converges instead
+			// of being rejected as a mirror flip. The streamBackupGate /
+			// delete are reserved for the genuinely-destructive primary→mirror
+			// direction. (The B1 passiveRoleWouldDemote guard above has already
+			// run, so a flag-toggled-off-while-ns-passive misconfig is still
+			// refused before we get here.)
+			if streamMirrorToPrimaryFlip(serverState, effectiveSpec) {
+				log.Info("Mirror→primary promote detected; converting IN PLACE (preserving messages) instead of delete+recreate.",
+					"streamName", stream.Spec.Name,
+					"serverMsgsPreserved", true,
+					"translated", translatePassive,
 				)
-				gated = true
-				gatedReason = reason
-				gatedMessage = msg
-				return nil
+				// Leave serverState set so the update path runs UpdateConfiguration
+				// (in place) rather than NewStream. streamSpecToConfig clears the
+				// server-side Mirror so the update drops it.
+			} else {
+				gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
+				if gateErr != nil {
+					return fmt.Errorf("evaluate backup gate: %w", gateErr)
+				}
+				if gateFires {
+					log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
+						"reason", reason, "message", msg,
+					)
+					gated = true
+					gatedReason = reason
+					gatedMessage = msg
+					return nil
+				}
+				log.Info("Source<->mirror flip detected (primary→mirror); force-recreating Stream.",
+					"specHasMirror", effectiveSpec.Mirror != nil,
+					"serverHasMirror", serverState.Mirror != nil,
+					"translated", translatePassive,
+				)
+				if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
+					return fmt.Errorf("force-delete on mirror flip: %w", delErr)
+				}
+				serverState = nil
 			}
-			log.Info("Source<->mirror flip detected; force-recreating Stream.",
-				"specHasMirror", effectiveSpec.Mirror != nil,
-				"serverHasMirror", serverState.Mirror != nil,
-				"translated", translatePassive,
-			)
-			if delErr := js.DeleteStream(stream.Spec.Name); delErr != nil && !jsmapi.IsNatsErr(delErr, JSStreamNotFoundErr) {
-				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
-			}
-			serverState = nil
 		}
 
 		// Check against known state. Skip Update if converged.
@@ -347,10 +372,31 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 
 			err = s.UpdateConfiguration(*serverState, targetConfig...)
 			if err != nil {
+				// DATA-LOSS GUARD (the promote fix): a subject-overlap rejection
+				// (10065) during a mirror→primary promote is a TRANSIENT ORDERING
+				// condition — the source still owns the subjects this destination
+				// is claiming, because the source has not finished demoting to
+				// mirror form yet. It is NOT a mirror-flip incompatibility. Force-
+				// deleting + recreating here would destroy the very messages the
+				// in-place promote preserves. Surface a retryable error so the
+				// next reconcile re-attempts the in-place update once the source
+				// has released the subjects (the DRP flip demotes the source
+				// before promoting the destination, so the overlap self-clears).
+				if isSubjectOverlapErr(err) {
+					log.Info("In-place promote rejected by NATS as subject-overlap (10065); source has not released subjects yet. Retrying in place (NOT deleting — preserves data).",
+						"streamName", stream.Spec.Name, "natsErr", err.Error(),
+					)
+					return fmt.Errorf("in-place mirror→primary promote of stream %q blocked by subject overlap (10065): source still owns the subjects (demote not yet converged); will retry without destroying data: %w", stream.Spec.Name, err)
+				}
 				// Reactive fallback: if NATS rejects because the requested
 				// change requires source<->mirror flip, force-delete and
 				// re-create. Bounded to a single retry.
-				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+				//
+				// NEVER take this destructive branch for a mirror→primary
+				// promote: that direction is achievable in place (drop Mirror)
+				// and deleting would lose the replicated data. Only the
+				// genuinely-impossible primary→mirror direction may recreate.
+				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) && !streamMirrorToPrimaryFlip(serverState, effectiveSpec) {
 					// B1 safety guard (reactive site): the proactive
 					// branch's predicate did not fire (maybe serverState
 					// wasn't yet mirror at the proactive check), but
@@ -619,15 +665,33 @@ func streamSpecToConfig(spec *api.StreamSpec, currentConfig *jsmapi.StreamConfig
 	// we don't set any placement option, avoiding unnecessary placement changes.
 
 	// mirror
+	//
+	// Always emit an explicit Mirror setter (NOT gated on spec.Mirror != nil).
+	// UpdateConfiguration uses the live serverState as its base, so a setter
+	// that is omitted leaves the server's previous value intact. For the
+	// DATA-PRESERVING mirror→primary promote we MUST clear the server-side
+	// Mirror in place — emitting `o.Mirror = nil` makes the in-place
+	// UpdateConfiguration drop the mirror (verified to retain messages against
+	// nats-server v2.14.0) instead of leaving the mirror set, which would make
+	// the update a no-op flip and force the destructive delete+recreate path.
 	if spec.Mirror != nil {
 		ss, err := mapJSMStreamSource(spec.Mirror)
 		if err != nil {
 			return nil, fmt.Errorf("map mirror stream source: %w", err)
 		}
 		opts = append(opts, jsm.Mirror(ss))
+	} else {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.Mirror = nil
+			return nil
+		})
 	}
 
 	// sources
+	//
+	// Same always-set rationale as mirror: clear the server-side Sources when
+	// the spec carries none, so an in-place update that drops sourcing
+	// converges rather than retaining the server's previous sources.
 	if spec.Sources != nil {
 		streamSources := make([]*jsmapi.StreamSource, 0)
 		for _, source := range spec.Sources {
@@ -639,6 +703,11 @@ func streamSpecToConfig(spec *api.StreamSpec, currentConfig *jsmapi.StreamConfig
 		}
 
 		opts = append(opts, jsm.Sources(streamSources...))
+	} else {
+		opts = append(opts, func(o *jsmapi.StreamConfig) error {
+			o.Sources = nil
+			return nil
+		})
 	}
 
 	// compression
@@ -908,6 +977,36 @@ func streamMirrorFlipped(serverState *jsmapi.StreamConfig, spec *api.StreamSpec)
 	return serverHasMirror != specHasMirror
 }
 
+// streamMirrorToPrimaryFlip reports whether the desired transition is the
+// DATA-PRESERVING mirror→primary direction: the server stream is currently a
+// mirror and the (effective) spec drops the mirror to become an authored
+// primary. This is the DRP "promote" — and on nats-server it is achievable
+// IN PLACE via UpdateConfiguration (drop Mirror + set Subjects) WITHOUT
+// deleting the server stream, so the messages already replicated into the
+// mirror are RETAINED. Empirically verified against nats-server v2.14.0
+// (TestStreamMirrorToPrimaryInPlacePreservesData).
+//
+// This is the inverse of the primary→mirror direction (server primary, spec
+// mirror), which nats-server genuinely cannot satisfy in place — that one
+// still requires the destructive delete + recreate.
+//
+// Why this distinction is load-bearing (the data-loss bug it fixes):
+// the DRP flip's PromotingDestination converts a scope-labeled mirror CR to
+// primary form. The prior code routed BOTH flip directions through
+// js.DeleteStream → NewStream. For the mirror→primary direction that DROPPED
+// the entire server-side JetStream stream (all messages) and recreated it
+// empty at seq 0 — exactly the live activitylog data loss observed on the
+// 2026-05-31 W→E flip (east activitylog seq1 timestamp == promote time, a
+// fresh epoch; the pre-promote replicated history was gone). Detecting this
+// direction lets the reconcile take the in-place UpdateConfiguration path
+// instead, preserving the data.
+func streamMirrorToPrimaryFlip(serverState *jsmapi.StreamConfig, spec *api.StreamSpec) bool {
+	if serverState == nil || spec == nil {
+		return false
+	}
+	return serverState.Mirror != nil && spec.Mirror == nil
+}
+
 // streamBackupGate evaluates whether the destructive recreate should be
 // held off pending external backup confirmation. Returns:
 //
@@ -985,4 +1084,17 @@ func isMirrorIncompatibleErr(err error) bool {
 	return jsmapi.IsNatsErr(err, JSStreamMirrorInvalidErr) ||
 		jsmapi.IsNatsErr(err, JSStreamMirrorWithSubjectsErr) ||
 		jsmapi.IsNatsErr(err, JSStreamMirrorWithSourcesErr)
+}
+
+// isSubjectOverlapErr returns true for the NATS subject-overlap rejection
+// (10065). During a mirror→primary promote this means the source still owns
+// the subjects the destination is claiming (the demote has not converged yet).
+// It is a TRANSIENT, RETRYABLE condition and MUST NOT trigger a destructive
+// delete+recreate — see JSStreamSubjectOverlapErr's doc. Shared by the Stream
+// and KeyValue reconcilers.
+func isSubjectOverlapErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return jsmapi.IsNatsErr(err, JSStreamSubjectOverlapErr)
 }
