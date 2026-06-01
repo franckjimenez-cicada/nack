@@ -242,7 +242,23 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		// Use the EFFECTIVE spec (possibly translated to mirror form) so
 		// passive-role translation triggers the destructive recreate path
 		// when the server still holds a primary KV stream.
-		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, effectiveSpec) {
+		// ACTIVE-role translation (inverse of passive translation) — see
+		// stream_controller.go + shouldConvertActiveRole for full rationale.
+		// When this cluster is ACTIVE and a scope-labeled, primary-form KV's
+		// SERVER backing stream is still a mirror, convert it back to a
+		// primary IN PLACE (UpdateKeyValue with the mirror-less targetConfig —
+		// retains all keys). Fires independently of --mirror-recreate-on-
+		// conflict because the in-place promote is non-destructive.
+		activePromote := serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() &&
+			shouldConvertActiveRole(isScopeLabeled(keyValue.Labels), localRole, effectiveSpec.Mirror != nil, serverState.Mirror != nil)
+		if activePromote {
+			log.Info("Active-role translation: scope KeyValue's server side is a mirror but local-role is active and the CR is primary-form; converting mirror→primary IN PLACE (preserving keys).",
+				"bucket", keyValue.Spec.Bucket,
+				"namespace", keyValue.Namespace,
+				"localRole", localRole,
+			)
+		}
+		if serverState != nil && !keyValue.Spec.PreventUpdate && !r.ReadOnly() && (activePromote || (r.MirrorRecreateOnConflict() && keyValueMirrorFlipped(serverState, effectiveSpec))) {
 			// B1 safety guard — see stream_controller.go for rationale.
 			if passiveRoleWouldDemote(serverState.Mirror != nil, effectiveSpec.Mirror != nil, localRole) {
 				passiveRoleGuardBlocked = true

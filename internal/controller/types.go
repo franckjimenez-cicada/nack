@@ -50,6 +50,16 @@ const (
 	// mirror externalApiPrefix).
 	localRoleAnnotation = "drp.cicada.io/local-role"
 	localRolePassive    = "passive"
+	// localRoleActive is the value the drp-operator stamps on the
+	// DESTINATION cluster's nats namespace after a promote. It is the
+	// trigger for ACTIVE-role translation (the inverse of passive
+	// translation): a scope-labeled, primary-form CR whose server stream
+	// is still a mirror is converted back to a primary IN PLACE. Note the
+	// ABSENCE of the annotation is ALSO treated as active (the
+	// backward-compatible default), so active-translation keys off
+	// "role != passive" rather than "role == active" — this constant is
+	// used for the explicit-active call sites + tests.
+	localRoleActive = "active"
 
 	// Condition type set on Stream / KeyValue CRs when the passive-role
 	// translation kicked in for the most recent reconcile pass. Distinct

@@ -268,7 +268,31 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// "old server is primary, new spec is mirror" path is recognized
 		// and the destructive recreate runs against the synthesized mirror
 		// — not the chart's primary form.
-		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, effectiveSpec) {
+		// ACTIVE-role translation (the inverse of passive-role translation,
+		// fork PR #8): when this cluster's nats namespace is ACTIVE (not
+		// passive) and a scope-labeled, primary-form CR's SERVER stream is
+		// still a MIRROR, convert it back to a PRIMARY IN PLACE (drop the
+		// server-side Mirror + set authored subjects via the same
+		// UpdateConfiguration mechanism PR #11 uses for the mirror→primary
+		// promote — it retains all replicated messages). This is the missing
+		// inverse that left the drp-operator promote unable to establish a
+		// primary under passive-translation (the live E→W failback bug). It
+		// fires INDEPENDENTLY of --mirror-recreate-on-conflict: that flag
+		// gates the DESTRUCTIVE primary→mirror recreate, but active-promote is
+		// non-destructive (in place), so it must not require the destructive
+		// flag to be enabled. Strictly gated (scope-labeled + active +
+		// server-currently-mirror + spec-primary) so steady-state primaries
+		// are never touched.
+		activePromote := serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() &&
+			shouldConvertActiveRole(isScopeLabeled(stream.Labels), localRole, effectiveSpec.Mirror != nil, serverState.Mirror != nil)
+		if activePromote {
+			log.Info("Active-role translation: scope stream's server side is a mirror but local-role is active and the CR is primary-form; converting mirror→primary IN PLACE (preserving messages).",
+				"streamName", stream.Spec.Name,
+				"namespace", stream.Namespace,
+				"localRole", localRole,
+			)
+		}
+		if serverState != nil && !stream.Spec.PreventUpdate && !r.ReadOnly() && (activePromote || (r.MirrorRecreateOnConflict() && streamMirrorFlipped(serverState, effectiveSpec))) {
 			// B1 safety guard: refuse the destructive recreate when the
 			// flip direction is mirror → primary AND the namespace is
 			// still annotated `local-role=passive`. The only realistic
