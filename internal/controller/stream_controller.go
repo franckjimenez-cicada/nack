@@ -242,6 +242,14 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			return err
 		}
 
+		// mustPromoteInPlace is set when the proactive flip block detects a
+		// mirror→primary promote. It (a) bypasses the converged-skip below so
+		// the in-place UpdateConfiguration actually runs even when stored==server
+		// (both mirror) and ObservedGeneration==Generation, and (b) triggers the
+		// post-update server-side re-read that asserts the mirror was genuinely
+		// dropped (never trust UpdateConfiguration's nil return for a promote).
+		var mustPromoteInPlace bool
+
 		// Map effective spec (possibly translated) to stream targetConfig,
 		// passing current server state for context.
 		targetConfig, err := streamSpecToConfig(effectiveSpec, serverState)
@@ -332,6 +340,20 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				// Leave serverState set so the update path runs UpdateConfiguration
 				// (in place) rather than NewStream. streamSpecToConfig clears the
 				// server-side Mirror so the update drops it.
+				//
+				// SILENT-NO-OP FIX: force the update to actually run. The
+				// converged-skip check below (storedState==serverState &&
+				// ObservedGeneration==Generation → return nil) would otherwise
+				// short-circuit this promote entirely: under passive-role
+				// translation the stored-state annotation holds the MIRROR config
+				// (persisted by a prior passive-era reconcile) and the server is
+				// still that same mirror, so the diff is empty and the reconcile
+				// returns nil WITHOUT ever calling UpdateConfiguration. That is the
+				// live "logs every 60s, no error, is_mirror stays true" loop. The
+				// CR generation does NOT bump on an ns local-role flip, so
+				// ObservedGeneration==Generation holds. Set mustPromoteInPlace so
+				// the converged-skip is bypassed and UpdateConfiguration runs.
+				mustPromoteInPlace = true
 			} else {
 				gateFires, reason, msg, gateErr := r.streamBackupGate(js, stream, serverState)
 				if gateErr != nil {
@@ -361,7 +383,12 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 		// Check against known state. Skip Update if converged.
 		// Storing returned state from the server avoids have to
 		// check default values or call Update on already converged resources
-		if storedState != nil && serverState != nil && stream.Status.ObservedGeneration == stream.Generation {
+		//
+		// NEVER skip when a mirror→primary promote is pending: the stored state
+		// and the live server are BOTH the mirror config (diff == ""), so this
+		// short-circuit would silently swallow the promote — the production
+		// silent-no-op bug. mustPromoteInPlace forces the update through.
+		if !mustPromoteInPlace && storedState != nil && serverState != nil && stream.Status.ObservedGeneration == stream.Generation {
 			diff := compareConfigState(storedState, serverState)
 
 			if diff == "" {
@@ -474,6 +501,23 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				updatedStream, err = js.LoadStream(stream.Spec.Name)
 				if err != nil {
 					return err
+				}
+
+				// POST-UPDATE VERIFICATION (the silent-no-op closer): never
+				// trust UpdateConfiguration's nil return for a mirror→primary
+				// promote. nats-server (and some merge paths) can ACK an update
+				// while leaving the server-side Mirror in place — the live bug
+				// where the reconcile logged success every ~60s but is_mirror
+				// stayed true. Re-read the freshly-loaded server config and, if
+				// this was a promote, assert the mirror is genuinely gone. If the
+				// mirror survives, return a RETRYABLE error so the next reconcile
+				// re-attempts — and NEVER mark the CR Ready while the server still
+				// shows a mirror.
+				if mustPromoteInPlace && updatedStream.Configuration().Mirror != nil {
+					log.Error(nil, "In-place mirror→primary promote did NOT drop the server-side mirror despite a nil UpdateConfiguration return; will retry (NOT marking Ready).",
+						"streamName", stream.Spec.Name,
+					)
+					return fmt.Errorf("in-place mirror→primary promote of stream %q reported success but server still shows a mirror; retrying", stream.Spec.Name)
 				}
 
 				diff := compareConfigState(updatedStream.Configuration(), *serverState)

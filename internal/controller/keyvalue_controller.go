@@ -236,6 +236,14 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			return err
 		}
 
+		// mustPromoteInPlace — set by the flip block when a mirror→primary KV
+		// promote is detected. Bypasses the converged-skip (so the in-place
+		// UpdateKeyValue runs even when stored==server are both the mirror and
+		// ObservedGeneration==Generation) and gates the post-update server re-read
+		// that asserts the backing-stream mirror was genuinely dropped. See
+		// stream_controller.go for the full silent-no-op rationale.
+		var mustPromoteInPlace bool
+
 		// Proactive source<->mirror flip handling. See the matching block in
 		// stream_controller.go for the rationale.
 		//
@@ -284,6 +292,14 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				)
 				// Leave serverState set so the update path runs UpdateKeyValue
 				// (in place) rather than CreateKeyValue.
+				//
+				// SILENT-NO-OP FIX (see stream_controller.go): force the update
+				// through. Under passive-role translation the stored-state
+				// annotation holds the MIRROR config and the server is still that
+				// mirror, so the converged-skip below would return nil WITHOUT
+				// running UpdateKeyValue — the live loop where the promote logs
+				// fire every reconcile but the backing stream stays a mirror.
+				mustPromoteInPlace = true
 			} else {
 				gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
 				if gateErr != nil {
@@ -313,7 +329,11 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 		// Check against known state. Skip Update if converged.
 		// Storing returned state from the server avoids have to
 		// check default values or call Update on already converged resources
-		if storedState != nil && serverState != nil && keyValue.Status.ObservedGeneration == keyValue.Generation {
+		//
+		// NEVER skip when a mirror→primary promote is pending: stored and live
+		// server are both the mirror (diff == ""), so this would silently swallow
+		// the promote. mustPromoteInPlace forces the UpdateKeyValue through.
+		if !mustPromoteInPlace && storedState != nil && serverState != nil && keyValue.Status.ObservedGeneration == keyValue.Generation {
 			diff := compareConfigState(storedState, serverState)
 
 			if diff == "" {
@@ -406,6 +426,19 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				if err != nil {
 					log.Error(err, "Failed to fetch updated KeyValue state")
 				} else {
+					// POST-UPDATE VERIFICATION (the silent-no-op closer): never
+					// trust UpdateKeyValue's nil return for a mirror→primary
+					// promote — re-read the backing stream config and, if this was
+					// a promote, assert the mirror is genuinely gone. If it
+					// survives, return a RETRYABLE error so the next reconcile
+					// re-attempts and the CR is NEVER marked Ready while the
+					// backing stream still shows a mirror.
+					if mustPromoteInPlace && refreshed != nil && refreshed.Mirror != nil {
+						log.Error(nil, "In-place mirror→primary KeyValue promote did NOT drop the backing-stream mirror despite a nil UpdateKeyValue return; will retry (NOT marking Ready).",
+							"bucket", keyValue.Spec.Bucket,
+						)
+						return fmt.Errorf("in-place mirror→primary promote of KeyValue %q reported success but backing stream still shows a mirror; retrying", keyValue.Spec.Bucket)
+					}
 					diff := compareConfigState(refreshed, serverState)
 					log.Info("Updated KeyValue.", "diff", diff)
 				}
