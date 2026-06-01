@@ -11,6 +11,8 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	jsmapi "github.com/nats-io/jsm.go/api"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -212,4 +215,163 @@ func Test_streamPromoteInPlace_subjectOverlapIsRetryableNotDestructive(t *testin
 	require.NoError(t, err)
 	assert.EqualValues(t, 12, final.State.Msgs, "all messages survive the eventually-successful in-place promote")
 	assert.Nil(t, final.Config.Mirror)
+}
+
+// newKVTestServer spins up an embedded JetStream NATS server and returns a
+// connected nats.go/jetstream.JetStream (the NEW API the KeyValue reconciler
+// uses — CreateKeyValue / UpdateKeyValue / Stream) plus a jsm.Manager for the
+// low-level identity probe. nats-server version is pinned by go.mod (v2.14.0).
+func newKVTestServer(t *testing.T) (jetstream.JetStream, *jsm.Manager, func()) {
+	t.Helper()
+	opts := &natsserver.DefaultTestOptions
+	opts.JetStream = true
+	opts.Port = -1
+	dir, err := os.MkdirTemp("", "nats-kv-promote-*")
+	require.NoError(t, err)
+	opts.StoreDir = dir
+
+	srv := natsserver.RunServer(opts)
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	js, err := jetstream.New(nc)
+	require.NoError(t, err)
+	mgr, err := jsm.New(nc)
+	require.NoError(t, err)
+
+	cleanup := func() {
+		nc.Close()
+		srv.Shutdown()
+		os.RemoveAll(dir)
+	}
+	return js, mgr, cleanup
+}
+
+// Test_keyValuePromoteInPlace_preservesKeys is the KeyValue analog of
+// Test_streamPromoteInPlace_preservesMessages, added because consumer-offsets
+// is a KeyValue and a KV IS promoted on every DRP flip — so the data-
+// preservation guarantee must be proven empirically against the real
+// nats-server, not just inferred from code review.
+//
+// It drives the EXACT production KV path the reconciler runs at
+// keyvalue_controller.go: build the targetConfig via keyValueSpecToConfig, then
+// js.UpdateKeyValue(ctx, targetConfig) — NOT a hand-rolled UpdateStream.
+//
+// FIXTURE FIDELITY — why the source stream rewrites subjects to the dst bucket:
+// In production the dst KV bucket mirrors a peer KV bucket with the SAME bucket
+// name across regions (e.g. dev-east "consumer-offsets" mirrors dev-west
+// "consumer-offsets"). A KV bucket stores its data under "$KV.<bucket>.>", so a
+// same-name cross-region mirror replicates messages whose subjects already
+// equal the dst bucket's own subjects. After promote, the dst stream's subject
+// filter ("$KV.<bucket>.>") therefore matches the stored messages and the keys
+// are readable. To reproduce that on a single embedded server (where two
+// streams can't both be named KV_consumer-offsets), the source is a separate
+// stream with a SubjectTransform that rewrites its subjects to
+// "$KV.<dstBucket>.>" — the exact subject shape a same-name cross-region mirror
+// yields. (Verified empirically: with a NAÏVE mirror of a differently-named
+// bucket the keys are stored under the SOURCE's subjects and become invisible
+// after promote — a fixture artifact, not a real bug; the production same-name
+// mirror keeps subjects aligned.)
+//
+// Flow: source KV bucket with 10 distinct key→value pairs → real MIRROR bucket
+// "consumer-offsets" (subjects transformed to its own) → flip the mirror's spec
+// to primary (drop Mirror) → run the production UpdateKeyValue in place →
+// assert all 10 keys + values survive AND are readable, the backing stream
+// identity (Created) is unchanged (NOT recreated), Mirror==nil, subjects are
+// the KV-standard "$KV.<bucket>.>".
+func Test_keyValuePromoteInPlace_preservesKeys(t *testing.T) {
+	js, mgr, cleanup := newKVTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const (
+		sourceBucket = "consumer-offsets-peer" // stands in for the remote-region peer
+		dstBucket    = "consumer-offsets"
+		nKeys        = 10
+	)
+
+	// Peer KV bucket with 10 distinct key→value pairs (the data to preserve).
+	source, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: sourceBucket})
+	require.NoError(t, err)
+	want := make(map[string]string, nKeys)
+	for i := 0; i < nKeys; i++ {
+		k := fmt.Sprintf("offset.%d", i)
+		v := fmt.Sprintf("value-%d", i)
+		_, perr := source.Put(ctx, k, []byte(v))
+		require.NoError(t, perr)
+		want[k] = v
+	}
+
+	// MIRROR KV bucket "consumer-offsets" that replicates the peer, rewriting
+	// subjects "$KV.<peer>.>" → "$KV.consumer-offsets.>" so the replicated
+	// messages land under the dst bucket's own subjects — exactly the subject
+	// shape a same-name cross-region mirror produces.
+	_, err = js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: dstBucket,
+		Mirror: &jetstream.StreamSource{
+			Name: kvStreamPrefix + sourceBucket,
+			SubjectTransforms: []jetstream.SubjectTransformConfig{
+				{
+					Source:      fmt.Sprintf("$KV.%s.>", sourceBucket),
+					Destination: fmt.Sprintf("$KV.%s.>", dstBucket),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	dstStreamName := kvStreamPrefix + dstBucket
+	require.Eventually(t, func() bool {
+		s, e := js.Stream(ctx, dstStreamName)
+		if e != nil {
+			return false
+		}
+		info, ie := s.Info(ctx)
+		return ie == nil && info.State.Msgs == nKeys
+	}, 5*time.Second, 100*time.Millisecond, "mirror KV must replicate all 10 keys before promote")
+
+	// Capture the backing stream's identity so we can prove it is NEVER
+	// recreated by the promote (a delete+recreate would reset Created).
+	beforeS, err := js.Stream(ctx, dstStreamName)
+	require.NoError(t, err)
+	beforeInfo, err := beforeS.Info(ctx)
+	require.NoError(t, err)
+	createdBefore := beforeInfo.Created
+	require.NotNil(t, beforeInfo.Config.Mirror, "precondition: dst KV backing stream is a mirror before promote")
+
+	// Source releases first (mirror→primary demote on the peer side), exactly
+	// as DemotingSource does before PromotingDestination — otherwise the promote
+	// would hit 10065 subject-overlap.
+	require.NoError(t, mgr.DeleteStream(kvStreamPrefix+sourceBucket))
+
+	// THE PROMOTE — in place, via the EXACT production calls.
+	dstKVSpec := &api.KeyValueSpec{Bucket: dstBucket} // primary form: no Mirror.
+	targetConfig, err := keyValueSpecToConfig(dstKVSpec)
+	require.NoError(t, err)
+	require.Nil(t, targetConfig.Mirror, "promote targetConfig must carry no mirror")
+	_, err = js.UpdateKeyValue(ctx, targetConfig)
+	require.NoError(t, err, "in-place mirror→primary KeyValue promote must be accepted by nats-server")
+
+	// Assertion 1: all 10 keys still present with the correct values.
+	promoted, err := js.KeyValue(ctx, dstBucket)
+	require.NoError(t, err)
+	keys, err := promoted.Keys(ctx)
+	require.NoError(t, err)
+	assert.Len(t, keys, nKeys, "all 10 keys must survive the in-place KV promote")
+	for k, v := range want {
+		entry, gerr := promoted.Get(ctx, k)
+		require.NoError(t, gerr, "key %q must still exist after promote", k)
+		assert.Equal(t, v, string(entry.Value()), "value for key %q must be preserved", k)
+	}
+
+	// Assertion 2: backing-stream identity unchanged (NOT recreated).
+	afterS, err := js.Stream(ctx, dstStreamName)
+	require.NoError(t, err)
+	afterInfo, err := afterS.Info(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, createdBefore, afterInfo.Created, "KV backing stream must be the SAME stream (Created unchanged) — a delete+recreate would reset it")
+	assert.EqualValues(t, nKeys, afterInfo.State.Msgs, "all 10 messages must remain on the backing stream")
+
+	// Assertion 3: Mirror dropped + subjects are the KV-standard form.
+	assert.Nil(t, afterInfo.Config.Mirror, "dst KV must be primary-form (Mirror==nil) after promote")
+	assert.Equal(t, []string{fmt.Sprintf("$KV.%s.>", dstBucket)}, afterInfo.Config.Subjects, "promoted KV backing stream must own the standard $KV.<bucket>.> subjects")
 }
