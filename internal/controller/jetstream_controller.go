@@ -37,6 +37,26 @@ const (
 	JSStreamMirrorWithSourcesErr  uint16 = 10031
 	JSStreamMirrorWithSubjectsErr uint16 = 10034
 	JSStreamMirrorInvalidErr      uint16 = 10055
+
+	// JSStreamSubjectOverlapErr is returned when a stream is configured with
+	// subjects that overlap a DIFFERENT existing stream. During a DRP promote
+	// (mirror→primary in place), the destination stream claims the subjects
+	// the source previously owned. If the destination's UpdateConfiguration
+	// lands BEFORE the source has released those subjects (i.e. before the
+	// source has been demoted to mirror form server-side), the server rejects
+	// the in-place promote with this code.
+	//
+	// CRITICAL: this is a TRANSIENT ORDERING condition, NOT a mirror-flip
+	// incompatibility. It MUST NOT be treated as a trigger for the destructive
+	// delete+recreate fallback — doing so would destroy exactly the messages
+	// the in-place promote is meant to preserve. The correct handling is to
+	// surface it as a retryable reconcile error so the next reconcile re-tries
+	// the in-place update once the source has released the subjects. The DRP
+	// flip runs DemotingSource — which converts the source to mirror form and
+	// releases its subjects — BEFORE PromotingDestination, so in the real flip
+	// the overlap clears on its own. Empirically reproduced + verified against
+	// nats-server v2.14.0.
+	JSStreamSubjectOverlapErr uint16 = 10065
 )
 
 var semVerRe = regexp.MustCompile(`\Av?([0-9]+)\.?([0-9]+)?\.?([0-9]+)?`)

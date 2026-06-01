@@ -252,28 +252,46 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 				)
 				return nil
 			}
-			gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
-			if gateErr != nil {
-				return fmt.Errorf("evaluate backup gate: %w", gateErr)
-			}
-			if gateFires {
-				log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
-					"reason", reason, "message", msg,
+			// DATA-PRESERVING mirror→primary promote (the data-loss fix). When
+			// the server KV is a mirror and the effective spec drops the mirror
+			// to become a primary bucket, do NOT delete: fall through to the
+			// normal update path, where UpdateKeyValue applies the mirror-less
+			// targetConfig in place and retains the keys. The destructive
+			// delete is reserved for the genuinely-impossible primary→mirror
+			// direction. The B1 passiveRoleWouldDemote guard above has already
+			// run, so a flag-toggled-off-while-passive misconfig is still
+			// refused before reaching here.
+			if keyValueMirrorToPrimaryFlip(serverState, effectiveSpec) {
+				log.Info("Mirror→primary KeyValue promote detected; converting IN PLACE (preserving keys) instead of delete+recreate.",
+					"bucket", keyValue.Spec.Bucket,
+					"translated", translatePassive,
 				)
-				gated = true
-				gatedReason = reason
-				gatedMessage = msg
-				return nil
+				// Leave serverState set so the update path runs UpdateKeyValue
+				// (in place) rather than CreateKeyValue.
+			} else {
+				gateFires, reason, msg, gateErr := r.keyValueBackupGate(ctx, js, keyValue)
+				if gateErr != nil {
+					return fmt.Errorf("evaluate backup gate: %w", gateErr)
+				}
+				if gateFires {
+					log.Info("Destructive recreate gated by --require-backup-confirmation; awaiting external backup.",
+						"reason", reason, "message", msg,
+					)
+					gated = true
+					gatedReason = reason
+					gatedMessage = msg
+					return nil
+				}
+				log.Info("Source<->mirror flip detected (primary→mirror); force-recreating KeyValue.",
+					"specHasMirror", effectiveSpec.Mirror != nil,
+					"serverHasMirror", serverState.Mirror != nil,
+					"translated", translatePassive,
+				)
+				if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
+					return fmt.Errorf("force-delete on mirror flip: %w", delErr)
+				}
+				serverState = nil
 			}
-			log.Info("Source<->mirror flip detected; force-recreating KeyValue.",
-				"specHasMirror", effectiveSpec.Mirror != nil,
-				"serverHasMirror", serverState.Mirror != nil,
-				"translated", translatePassive,
-			)
-			if delErr := js.DeleteKeyValue(ctx, keyValue.Spec.Bucket); delErr != nil && !errors.Is(delErr, jetstream.ErrBucketNotFound) {
-				return fmt.Errorf("force-delete on mirror flip: %w", delErr)
-			}
-			serverState = nil
 		}
 
 		// Check against known state. Skip Update if converged.
@@ -309,9 +327,27 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			log.Info("Updating KeyValue.")
 			updatedKeyValue, err = js.UpdateKeyValue(ctx, targetConfig)
 			if err != nil {
+				// DATA-LOSS GUARD (the promote fix): a subject-overlap (10065)
+				// during a mirror→primary KV promote is a transient ordering
+				// condition (source has not released the backing stream's
+				// subjects yet), NOT a mirror-flip incompatibility. Surface it
+				// as a retryable error rather than force-deleting the bucket,
+				// which would destroy the replicated keys. The DRP flip demotes
+				// the source before promoting the destination, so the overlap
+				// self-clears on a subsequent reconcile.
+				if isSubjectOverlapErr(err) {
+					log.Info("In-place KeyValue promote rejected as subject-overlap (10065); source not yet demoted. Retrying in place (NOT deleting — preserves data).",
+						"bucket", keyValue.Spec.Bucket, "natsErr", err.Error(),
+					)
+					return fmt.Errorf("in-place mirror→primary promote of KeyValue %q blocked by subject overlap (10065): source still owns the subjects (demote not yet converged); will retry without destroying data: %w", keyValue.Spec.Bucket, err)
+				}
 				// Reactive fallback: recreate the underlying KV stream when
 				// NATS rejects the update as mirror-incompatible.
-				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) {
+				//
+				// NEVER take this destructive branch for a mirror→primary
+				// promote — that direction is achievable in place (drop Mirror)
+				// and deleting would lose the replicated keys.
+				if r.MirrorRecreateOnConflict() && isMirrorIncompatibleErr(err) && !keyValueMirrorToPrimaryFlip(serverState, effectiveSpec) {
 					// B1 safety guard (reactive site) — see stream_controller.go
 					// for full rationale, including the note on serverState
 					// staleness across the UpdateKeyValue boundary.
@@ -614,4 +650,21 @@ func keyValueMirrorFlipped(serverState *jetstream.StreamConfig, spec *api.KeyVal
 	serverHasMirror := serverState.Mirror != nil
 	specHasMirror := spec.Mirror != nil
 	return serverHasMirror != specHasMirror
+}
+
+// keyValueMirrorToPrimaryFlip reports whether the desired transition is the
+// DATA-PRESERVING mirror→primary promote: the server KV stream is a mirror and
+// the (effective) spec drops the mirror to become a primary bucket. As with
+// Streams, nats-server allows this conversion IN PLACE — the high-level
+// UpdateKeyValue with a mirror-less config drops the mirror without deleting
+// the underlying KV_<bucket> stream, so the replicated keys are RETAINED
+// (verified against nats-server v2.14.0). The prior code routed this through
+// js.DeleteKeyValue → CreateKeyValue, which dropped the entire backing stream
+// (all keys) and recreated it empty — the KeyValue analog of the Stream
+// data-loss bug.
+func keyValueMirrorToPrimaryFlip(serverState *jetstream.StreamConfig, spec *api.KeyValueSpec) bool {
+	if serverState == nil || spec == nil {
+		return false
+	}
+	return serverState.Mirror != nil && spec.Mirror == nil
 }
