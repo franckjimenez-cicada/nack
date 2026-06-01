@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ktypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/nats-io/nack/pkg/jetstream/apis/jetstream/v1beta2"
@@ -230,4 +231,169 @@ func Test_keyValueConvergedSkip_doesNotSwallowMirrorToPrimaryPromote(t *testing.
 	keys, err := promoted.Keys(ctx)
 	require.NoError(t, err)
 	assert.Len(t, keys, nKeys, "all keys retained after the promote")
+}
+
+// --- read-error injection harness for the post-update verification hardening ---
+
+// faultyVerifyJS wraps a real jetstream.JetStream and, once UpdateKeyValue has
+// been called, fails the NEXT Stream() lookup with a transient error. This
+// simulates a STREAM.INFO blip occurring precisely between the post-update
+// verification read and the annotation-persist re-read — the narrow window in
+// which a swallowed read-error could mark the CR Ready while still a mirror.
+type faultyVerifyJS struct {
+	jetstream.JetStream
+	updated   bool
+	failNext  bool
+	failOnce  bool // once we've injected the failure, stop failing
+	transient error
+}
+
+func (f *faultyVerifyJS) UpdateKeyValue(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
+	kv, err := f.JetStream.UpdateKeyValue(ctx, cfg)
+	if err == nil {
+		f.updated = true
+		f.failNext = true // arm the failure for the post-update verification read
+	}
+	return kv, err
+}
+
+func (f *faultyVerifyJS) Stream(ctx context.Context, name string) (jetstream.Stream, error) {
+	if f.failNext && !f.failOnce {
+		f.failNext = false
+		f.failOnce = true
+		return nil, f.transient
+	}
+	return f.JetStream.Stream(ctx, name)
+}
+
+// faultyVerifyController wraps a JetStreamController so the closure passed to
+// WithJetStreamClient receives the faulting JS decorator instead of the raw one.
+type faultyVerifyController struct {
+	JetStreamController
+	js *faultyVerifyJS
+}
+
+func (c *faultyVerifyController) WithJetStreamClient(opts api.ConnectionOpts, ns string, op func(js jetstream.JetStream) error) error {
+	return c.JetStreamController.WithJetStreamClient(opts, ns, func(js jetstream.JetStream) error {
+		c.js.JetStream = js
+		return op(c.js)
+	})
+}
+
+// Test_keyValuePromoteVerifyReadError_returnsRetryableNotReady proves the
+// hardening: when the post-update verification re-read ERRORS during a
+// mirror→primary KV promote, createOrUpdate returns that (retryable) error
+// rather than swallowing it and falling through to mark the CR Ready. Without
+// the fix, the swallowed error lets the annotation-persist re-read succeed and
+// the CR is marked Ready while the backing stream is still a mirror.
+func Test_keyValuePromoteVerifyReadError_returnsRetryableNotReady(t *testing.T) {
+	srv, mgr, _, cleanup := newJSTestServerWithURL(t)
+	defer cleanup()
+
+	const (
+		natsNS       = "nats"
+		sourceBucket = "consumer-offsets-peer"
+		dstBucket    = "consumer-offsets"
+		nKeys        = 6
+	)
+	ctx := context.Background()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	defer nc.Close()
+	jsNew, err := jetstream.New(nc)
+	require.NoError(t, err)
+
+	source, err := jsNew.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: sourceBucket})
+	require.NoError(t, err)
+	for i := 0; i < nKeys; i++ {
+		_, perr := source.Put(ctx, fmt.Sprintf("offset.%d", i), []byte(fmt.Sprintf("v-%d", i)))
+		require.NoError(t, perr)
+	}
+
+	_, err = jsNew.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: dstBucket,
+		Mirror: &jetstream.StreamSource{
+			Name: kvStreamPrefix + sourceBucket,
+			SubjectTransforms: []jetstream.SubjectTransformConfig{
+				{Source: fmt.Sprintf("$KV.%s.>", sourceBucket), Destination: fmt.Sprintf("$KV.%s.>", dstBucket)},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	dstStreamName := kvStreamPrefix + dstBucket
+	require.Eventually(t, func() bool {
+		s, e := jsNew.Stream(ctx, dstStreamName)
+		if e != nil {
+			return false
+		}
+		info, ie := s.Info(ctx)
+		return ie == nil && info.State.Msgs == nKeys
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// Source releases first so the promote isn't blamed on 10065.
+	require.NoError(t, mgr.DeleteStream(kvStreamPrefix+sourceBucket))
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        natsNS,
+			Annotations: map[string]string{localRoleAnnotation: localRoleActive},
+		},
+	}
+	kvCR := &api.KeyValue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "consumer-offsets-dev",
+			Namespace:  natsNS,
+			Generation: 1,
+			Labels:     map[string]string{scopeLabel: "true"},
+		},
+		Spec: api.KeyValueSpec{Bucket: dstBucket},
+		Status: api.Status{
+			Conditions: []api.Condition{{Type: readyCondType, Status: corev1.ConditionUnknown}},
+		},
+	}
+	sch := activeXlatScheme(t)
+	k8s := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(ns, kvCR).
+		WithStatusSubresource(&api.KeyValue{}).
+		Build()
+
+	base, err := NewJSController(k8s, &NatsConfig{ServerURL: srv.ClientURL()}, &Config{
+		Namespace:                natsNS,
+		MirrorRecreateOnConflict: false,
+	})
+	require.NoError(t, err)
+
+	// Wrap the controller so the post-update verification read fails transiently.
+	faulty := &faultyVerifyController{
+		JetStreamController: base,
+		js:                  &faultyVerifyJS{transient: fmt.Errorf("transient STREAM.INFO failure")},
+	}
+	r := &KeyValueReconciler{Scheme: sch, JetStreamController: faulty}
+
+	// The reconcile MUST return an error (retryable) — NOT swallow the read
+	// failure and mark Ready.
+	rerr := r.createOrUpdate(ctx, logr.Discard(), kvCR)
+	require.Error(t, rerr, "post-update verification read-error during a promote must surface as a retryable error, not be swallowed")
+	assert.Contains(t, rerr.Error(), "verify KeyValue", "error must come from the verification-read hardening path")
+
+	// The CR must NOT have been marked Ready=True.
+	gotCR := &api.KeyValue{}
+	require.NoError(t, k8s.Get(ctx, ktypes.NamespacedName{Namespace: natsNS, Name: "consumer-offsets-dev"}, gotCR))
+	for _, c := range gotCR.Status.Conditions {
+		if c.Type == readyCondType {
+			assert.NotEqual(t, corev1.ConditionTrue, c.Status, "CR must NOT be Ready while the promote could not be verified")
+		}
+	}
+
+	// Sanity: the injected failure fired exactly once, so a follow-up reconcile
+	// (with the now-healthy read) converges the promote — proving it's retryable.
+	require.NoError(t, r.createOrUpdate(ctx, logr.Discard(), kvCR), "follow-up reconcile must converge once the read recovers")
+	afterS, err := jsNew.Stream(ctx, dstStreamName)
+	require.NoError(t, err)
+	afterInfo, err := afterS.Info(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, afterInfo.Config.Mirror, "backing stream is primary-form after the retry converges")
 }

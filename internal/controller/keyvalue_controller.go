@@ -424,6 +424,23 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			} else {
 				refreshed, err := getServerKeyValueState(ctx, js, keyValue)
 				if err != nil {
+					// POST-UPDATE VERIFICATION read-error hardening: during a
+					// mirror→primary promote we MUST positively confirm the
+					// backing-stream mirror is gone before marking the CR Ready.
+					// If this verification re-read ERRORS (transient STREAM.INFO
+					// failure), do NOT swallow it — falling through would re-read
+					// in the annotation-persist block below and, if THAT read
+					// succeeds while the server is still a mirror, mark the CR
+					// Ready without ever hitting the Mirror!=nil guard. Return the
+					// error (retryable) so the next reconcile re-verifies. (Mirrors
+					// the Stream path, where js.LoadStream's error returns
+					// immediately.) Behavior unchanged when not promoting.
+					if mustPromoteInPlace {
+						log.Error(err, "Failed to verify KeyValue state after in-place promote; cannot confirm mirror was dropped, will retry (NOT marking Ready).",
+							"bucket", keyValue.Spec.Bucket,
+						)
+						return fmt.Errorf("verify KeyValue %q state after in-place mirror→primary promote: %w", keyValue.Spec.Bucket, err)
+					}
 					log.Error(err, "Failed to fetch updated KeyValue state")
 				} else {
 					// POST-UPDATE VERIFICATION (the silent-no-op closer): never
