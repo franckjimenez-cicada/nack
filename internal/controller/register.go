@@ -121,6 +121,16 @@ type Config struct {
 	// "$JS.dev-2nd-east.API". Empty disables translation regardless
 	// of the namespace annotation.
 	CrossRegionNATSDomain string
+
+	// ColdStartRoleDefaultPassive, when true, makes an ABSENT
+	// `drp.cicada.io/local-role` annotation be treated as passive (mirror)
+	// instead of the default active (primary). Set per-deployment on the
+	// SECONDARY region so a fresh cluster fails CLOSED before the
+	// drp-operator stamps a role — avoiding a transient dual-primary
+	// window. Off by default (backward-compatible: absent → active). Only
+	// honored when EnablePassiveRoleTranslation + CrossRegionNATSDomain are
+	// set (same precondition as explicit-passive translation).
+	ColdStartRoleDefaultPassive bool
 }
 
 // RegisterAll registers all available jetStream controllers to the manager.

@@ -120,12 +120,14 @@ func TestTranslateKeyValueSpecToMirror(t *testing.T) {
 // + the two new accessors. No need to mock the rest of JetStreamController.
 type fakePassiveRoleGate struct {
 	client.Client
-	enabled bool
-	domain  string
+	enabled          bool
+	domain           string
+	coldStartPassive bool
 }
 
-func (f *fakePassiveRoleGate) PassiveRoleTranslationEnabled() bool { return f.enabled }
-func (f *fakePassiveRoleGate) CrossRegionNATSDomain() string       { return f.domain }
+func (f *fakePassiveRoleGate) PassiveRoleTranslationEnabled() bool  { return f.enabled }
+func (f *fakePassiveRoleGate) CrossRegionNATSDomain() string        { return f.domain }
+func (f *fakePassiveRoleGate) ColdStartRoleDefaultsPassive() bool   { return f.coldStartPassive }
 
 func newFakeGate(t *testing.T, enabled bool, domain string, nsAnnotations map[string]string) *fakePassiveRoleGate {
 	t.Helper()
@@ -148,6 +150,7 @@ func TestShouldTranslatePassiveRole(t *testing.T) {
 		name         string
 		enabled      bool
 		domain       string
+		coldStart    bool
 		nsAnnots     map[string]string
 		wantTrans    bool
 		wantRole     string
@@ -201,10 +204,53 @@ func TestShouldTranslatePassiveRole(t *testing.T) {
 			wantTrans: false,
 			wantRole:  "Passive",
 		},
+		{
+			// Cold-start hardening: absent annotation + cold-start-default
+			// passive (secondary region) → translate to mirror. The RAW role
+			// surfaces as "" (not the synthesized passive) so the
+			// destructive-recreate guard sees the true state.
+			name:      "annotation absent + cold-start-default passive → translate",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			coldStart: true,
+			nsAnnots:  nil,
+			wantTrans: true,
+			wantRole:  "",
+		},
+		{
+			name:      "annotation absent + cold-start passive but feature disabled → no translate",
+			enabled:   false,
+			domain:    "dev-2nd-east",
+			coldStart: true,
+			nsAnnots:  nil,
+			wantTrans: false,
+			wantRole:  "",
+		},
+		{
+			name:      "annotation absent + cold-start passive but domain empty → no translate",
+			enabled:   true,
+			domain:    "",
+			coldStart: true,
+			nsAnnots:  nil,
+			wantTrans: false,
+			wantRole:  "",
+		},
+		{
+			// Explicit active must NEVER translate, even with cold-start
+			// passive set — the default only applies to an ABSENT annotation.
+			name:      "annotation active + cold-start passive → no translate (explicit wins)",
+			enabled:   true,
+			domain:    "dev-2nd-east",
+			coldStart: true,
+			nsAnnots:  map[string]string{localRoleAnnotation: "active"},
+			wantTrans: false,
+			wantRole:  "active",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			jsc := newFakeGate(t, tc.enabled, tc.domain, tc.nsAnnots)
+			jsc.coldStartPassive = tc.coldStart
 			gotTrans, gotRole, err := shouldTranslatePassiveRole(context.Background(), jsc, "nats")
 			if tc.wantError && err == nil {
 				t.Fatalf("want error, got nil")

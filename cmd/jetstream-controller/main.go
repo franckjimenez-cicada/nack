@@ -104,6 +104,8 @@ func run() error {
 		"Translate primary-form Stream/KeyValue CRs to mirror form when the namespace carries `drp.cicada.io/local-role=passive`. The K8s CR is NOT modified — translation only affects what is applied to the NATS server. Eliminates the ArgoCD selfHeal vs drp-operator race on the passive region post-flip. Requires --cross-region-nats-domain to be set; off by default.")
 	crossRegionNATSDomain := flag.String("cross-region-nats-domain", "",
 		"JetStream domain of the peer region (e.g. `dev-2nd-east` when running on dev-west). Used by --enable-passive-role-translation to synthesize `externalApiPrefix=$JS.<domain>.API` on the translated mirror config. Required for translation; ignored when --enable-passive-role-translation is off.")
+	coldStartDefaultPassive := flag.Bool("cold-start-default-passive", false,
+		"When the `drp.cicada.io/local-role` annotation is ABSENT (the drp-operator has not stamped a role yet on a fresh cluster), treat the namespace as passive (mirror) instead of the default active (primary). Set this on the SECONDARY region only, so a cold start fails CLOSED rather than risking a transient dual-primary. Off by default; only honored with --enable-passive-role-translation + --cross-region-nats-domain.")
 
 	flag.Parse()
 
@@ -158,6 +160,7 @@ func run() error {
 			DefaultAccount:               *defaultAccount,
 			EnablePassiveRoleTranslation: *enablePassiveRoleTranslation,
 			CrossRegionNATSDomain:        *crossRegionNATSDomain,
+			ColdStartRoleDefaultPassive:  *coldStartDefaultPassive,
 		}
 
 		return runControlLoop(config, natsCfg, controllerCfg)
