@@ -29,11 +29,16 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -650,9 +655,30 @@ func keyValueSpecToConfig(spec *api.KeyValueSpec) (jetstream.KeyValueConfig, err
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *KeyValueReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// GenerationChangedPredicate scoped to the KeyValue source only; the
+	// namespace watch needs its own predicate (a local-role annotation
+	// change doesn't bump the Namespace generation). See the Stream
+	// controller for the full rationale.
+	c := mgr.GetClient()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&api.KeyValue{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		For(&api.KeyValue{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(
+			&v1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, ns client.Object) []reconcile.Request {
+				var list api.KeyValueList
+				if err := c.List(ctx, &list, client.InNamespace(ns.GetName())); err != nil {
+					return nil
+				}
+				reqs := make([]reconcile.Request, 0, len(list.Items))
+				for i := range list.Items {
+					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: list.Items[i].Namespace, Name: list.Items[i].Name,
+					}})
+				}
+				return reqs
+			}),
+			builder.WithPredicates(localRoleChangedPredicate()),
+		).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 1,
 		}).

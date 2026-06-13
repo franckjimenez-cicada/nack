@@ -31,11 +31,16 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // StreamReconciler reconciles a Stream object
@@ -1023,9 +1028,31 @@ func mapJSMStreamSource(ss *api.StreamSource) (*jsmapi.StreamSource, error) {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *StreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// GenerationChangedPredicate is scoped to the Stream source ONLY (it was
+	// previously a global WithEventFilter). The namespace watch needs its own
+	// predicate because a local-role annotation change does NOT bump the
+	// Namespace's generation, so a global GenerationChangedPredicate would
+	// filter every namespace event out.
+	c := mgr.GetClient()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&api.Stream{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		For(&api.Stream{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(
+			&v1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, ns client.Object) []reconcile.Request {
+				var list api.StreamList
+				if err := c.List(ctx, &list, client.InNamespace(ns.GetName())); err != nil {
+					return nil
+				}
+				reqs := make([]reconcile.Request, 0, len(list.Items))
+				for i := range list.Items {
+					reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: list.Items[i].Namespace, Name: list.Items[i].Name,
+					}})
+				}
+				return reqs
+			}),
+			builder.WithPredicates(localRoleChangedPredicate()),
+		).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 1,
 		}).
