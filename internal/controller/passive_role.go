@@ -31,6 +31,13 @@ type passiveRoleGate interface {
 	client.Reader
 	PassiveRoleTranslationEnabled() bool
 	CrossRegionNATSDomain() string
+	// ColdStartRoleDefaultsPassive reports whether an ABSENT local-role
+	// annotation should be treated as passive (instead of the default
+	// active). Set per-deployment on the SECONDARY region so that, before
+	// the drp-operator has stamped a role on a fresh cluster, this region
+	// fails CLOSED (mirror) rather than open (primary) — avoiding a
+	// transient dual-primary window. The primary region leaves this off.
+	ColdStartRoleDefaultsPassive() bool
 }
 
 // readLocalRole returns the value of `drp.cicada.io/local-role` on the
@@ -82,7 +89,17 @@ func shouldTranslatePassiveRole(ctx context.Context, g passiveRoleGate, namespac
 	if g.CrossRegionNATSDomain() == "" {
 		return false, role, nil
 	}
-	return role == localRolePassive, role, nil
+	// Cold-start hardening: when the annotation is ABSENT (the drp-operator
+	// has not stamped a role yet on a fresh cluster) and this deployment is
+	// configured to default unset→passive (the secondary region), treat it
+	// as passive so we fail CLOSED to mirror rather than open to primary.
+	// The RAW role ("") is still returned so the destructive-recreate guard
+	// sees the true annotation state, not the synthesized default.
+	effective := role
+	if effective == "" && g.ColdStartRoleDefaultsPassive() {
+		effective = localRolePassive
+	}
+	return effective == localRolePassive, role, nil
 }
 
 // scopeLabel is the label key that marks a Stream / KeyValue CR as

@@ -120,6 +120,12 @@ type JetStreamController interface {
 	// used when synthesizing mirror config under passive-role
 	// translation. Empty disables translation.
 	CrossRegionNATSDomain() string
+
+	// ColdStartRoleDefaultsPassive returns true when an ABSENT
+	// `drp.cicada.io/local-role` annotation should be treated as passive
+	// (mirror) instead of the default active. Set on the secondary region
+	// so a cold start fails closed. See Config.ColdStartRoleDefaultPassive.
+	ColdStartRoleDefaultsPassive() bool
 }
 
 func NewJSController(k8sClient client.Client, natsConfig *NatsConfig, controllerConfig *Config) (JetStreamController, error) {
@@ -186,6 +192,10 @@ func (c *jsController) PassiveRoleTranslationEnabled() bool {
 
 func (c *jsController) CrossRegionNATSDomain() string {
 	return c.controllerConfig.CrossRegionNATSDomain
+}
+
+func (c *jsController) ColdStartRoleDefaultsPassive() bool {
+	return c.controllerConfig.ColdStartRoleDefaultPassive
 }
 
 func (c *jsController) ValidNamespace(namespace string) bool {
