@@ -426,6 +426,70 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 				return err
 			}
 
+			// TWO-PHASE in-place mirror→primary promote (the 10034 fix).
+			//
+			// A single UpdateConfiguration that BOTH drops the mirror AND sets
+			// Subjects on a stream the server STILL sees as a mirror is rejected
+			// by some nats-server versions with 10034 "stream mirrors can not
+			// contain subjects" — you cannot add subjects to a stream while it is
+			// still a mirror in one step. (The embedded v2.14.0 used by the unit
+			// tests happens to accept the one-shot update; the PROD server did
+			// not, stranding the DRP flip at PromotingDestination with 32/37
+			// streams looping 10034 forever.) Split the promote into two
+			// sequential, DATA-SAFE updates — NEVER a delete, so all replicated
+			// messages survive:
+			//
+			//   Phase 1 — un-mirror: UpdateConfiguration with Mirror=nil,
+			//     Sources=nil and Subjects=nil. The server stream becomes a
+			//     standalone (non-mirror) stream that RETAINS its messages and has
+			//     no subjects yet — a valid config that does not trip 10034.
+			//   Phase 2 — add subjects: re-LoadStream (fresh, now-standalone
+			//     server state) and UpdateConfiguration with the authored target
+			//     config. The stream is no longer a mirror, so 10034 cannot fire.
+			//
+			// Guarded so it fires ONLY for a genuine promote whose target has
+			// subjects: mustPromoteInPlace (server mirror + spec primary, set by
+			// the flip block above) AND the live server is still a mirror AND the
+			// target config carries Subjects. A promote whose target legitimately
+			// has no subjects already converges in a single update, so it keeps
+			// the normal single-update path. The B1 passiveRoleWouldDemote guard
+			// and the 10065 retryable handling are upstream/below and unchanged.
+			//
+			// Idempotency: reconciles are re-entrant. If only phase 1 lands (e.g.
+			// the pass errors before phase 2, or phase 2 hits the transient 10065
+			// overlap), the next reconcile sees a now-standalone stream — at which
+			// point mustPromoteInPlace/serverState.Mirror is false, this block is
+			// skipped, and the ordinary single update applies the subjects. So the
+			// promote converges whether both phases run in one pass or across two.
+			if mustPromoteInPlace && serverState.Mirror != nil && targetConfigHasSubjects(effectiveSpec) {
+				log.Info("Two-phase in-place mirror→primary promote: phase 1 un-mirror (drop Mirror/Sources, no subjects yet) to avoid 10034 before adding subjects.",
+					"streamName", stream.Spec.Name,
+				)
+				if p1err := s.UpdateConfiguration(*serverState, unmirrorStreamOpts()...); p1err != nil {
+					// Phase 1 itself can hit the transient 10065 overlap if the
+					// source has not released subjects yet; surface it as the same
+					// retryable error the single-update path uses (NOT destructive).
+					if isSubjectOverlapErr(p1err) {
+						log.Info("Phase-1 un-mirror rejected by NATS as subject-overlap (10065); source has not released subjects yet. Retrying in place (NOT deleting — preserves data).",
+							"streamName", stream.Spec.Name, "natsErr", p1err.Error(),
+						)
+						return fmt.Errorf("phase-1 un-mirror of stream %q blocked by subject overlap (10065): source still owns the subjects (demote not yet converged); will retry without destroying data: %w", stream.Spec.Name, p1err)
+					}
+					return fmt.Errorf("phase-1 un-mirror of stream %q: %w", stream.Spec.Name, p1err)
+				}
+				// Re-load fresh server state: phase 2 must operate on the
+				// now-standalone (non-mirror) stream, not the stale mirror config.
+				s, err = js.LoadStream(stream.Spec.Name)
+				if err != nil {
+					return fmt.Errorf("reload stream %q after phase-1 un-mirror: %w", stream.Spec.Name, err)
+				}
+				freshState := s.Configuration()
+				serverState = &freshState
+				log.Info("Two-phase in-place mirror→primary promote: phase 2 add authored subjects to the now-standalone stream.",
+					"streamName", stream.Spec.Name,
+				)
+			}
+
 			err = s.UpdateConfiguration(*serverState, targetConfig...)
 			if err != nil {
 				// DATA-LOSS GUARD (the promote fix): a subject-overlap rejection
@@ -652,6 +716,34 @@ func getServerStreamState(jsm *jsm.Manager, stream *api.Stream) (*jsmapi.StreamC
 
 	streamCfg := s.Configuration()
 	return &streamCfg, nil
+}
+
+// targetConfigHasSubjects reports whether the (effective) primary spec the
+// promote is converging toward carries any subjects. The two-phase split is
+// only needed when subjects are being ADDED to a still-mirror stream — that is
+// the exact shape nats-server rejects with 10034. A promote whose target has
+// no subjects converges in a single update, so it must keep the normal path.
+func targetConfigHasSubjects(spec *api.StreamSpec) bool {
+	return spec != nil && len(spec.Subjects) > 0
+}
+
+// unmirrorStreamOpts builds the phase-1 ("un-mirror") UpdateConfiguration
+// option set for the data-safe two-phase mirror→primary promote: drop the
+// server-side Mirror and Sources and set NO subjects. Applied on top of the
+// live (mirror-bearing) server config, it converts the stream to a standalone
+// stream that RETAINS all its replicated messages and has no subjects yet — a
+// valid config that does not trip 10034 "stream mirrors can not contain
+// subjects". Phase 2 then adds the authored subjects to the now-standalone
+// stream via the normal targetConfig. NEVER deletes — preserves data.
+func unmirrorStreamOpts() []jsm.StreamOption {
+	return []jsm.StreamOption{
+		func(o *jsmapi.StreamConfig) error {
+			o.Mirror = nil
+			o.Sources = nil
+			o.Subjects = nil
+			return nil
+		},
+	}
 }
 
 func streamSpecToConfig(spec *api.StreamSpec, currentConfig *jsmapi.StreamConfig) ([]jsm.StreamOption, error) {
