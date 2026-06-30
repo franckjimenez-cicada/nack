@@ -224,6 +224,50 @@ func translateStreamSpecToMirror(orig *api.StreamSpec, remoteDomain string) api.
 	return translated
 }
 
+// translateStreamSpecToPrimary is the INVERSE of translateStreamSpecToMirror:
+// it returns a deep-copied spec with Mirror + Sources cleared, leaving the
+// authored Subjects intact, so the effective spec is PRIMARY form.
+//
+// Why this is needed: the DRP gitops authors the secondary region's scope
+// streams in "mirror baseline" form — the in-cluster CR carries BOTH a Mirror
+// (used while the region is passive) AND the authored Subjects (used once it is
+// promoted). passive-role translation handles the passive direction (drop
+// Subjects, set Mirror). Its inverse was missing: when the region flips ACTIVE,
+// the CR's effective spec STILL had the authored Mirror, so shouldConvertActiveRole
+// (which requires a primary-form effective spec) never fired and nack applied a
+// Mirror+Subjects config the server rejects with 10034. Stripping the Mirror here
+// makes the effective spec primary-form, so the in-place two-phase promote
+// converges the server mirror to a primary WITHOUT deleting (messages preserved).
+// The in-cluster CR is left untouched (server-side translation only).
+func translateStreamSpecToPrimary(orig *api.StreamSpec) api.StreamSpec {
+	translated := *orig.DeepCopy()
+	translated.Mirror = nil
+	translated.Sources = nil
+	return translated
+}
+
+// shouldTranslateActiveRole reports whether the reconciler should strip a
+// CR-authored Mirror so the effective spec is primary form — the ACTIVE-region
+// inverse of shouldTranslatePassiveRole. Fires only when ALL hold:
+//   - passive-role translation is feature-enabled (the same DRP gate; outside
+//     DRP mode the CR is applied exactly as authored).
+//   - the CR is scope-labeled (drp.cicada.io/nats-failover-scope set).
+//   - the namespace is NOT effectively passive — i.e. local-role=active, or
+//     absent and this deployment does NOT cold-start-default to passive (same
+//     semantics shouldTranslatePassiveRole uses for the passive direction).
+//   - the authored spec actually carries a Mirror to strip (a CR already in
+//     primary form needs no translation; the normal path converges it).
+func shouldTranslateActiveRole(translationEnabled, scopeLabeled bool, localRole string, coldStartDefaultsPassive, specHasMirror bool) bool {
+	if !translationEnabled || !scopeLabeled || !specHasMirror {
+		return false
+	}
+	effective := localRole
+	if effective == "" && coldStartDefaultsPassive {
+		effective = localRolePassive
+	}
+	return effective != localRolePassive
+}
+
 // translateKeyValueSpecToMirror is the KeyValue analog. The underlying
 // JetStream stream that backs a KV bucket is named "KV_<bucket>", so the
 // mirror's Name field uses that convention. The deliver prefix follows

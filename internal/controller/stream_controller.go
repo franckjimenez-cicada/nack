@@ -233,6 +233,25 @@ func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, 
 			"namespace", stream.Namespace,
 			"streamName", stream.Spec.Name,
 		)
+	} else if shouldTranslateActiveRole(
+		r.JetStreamController.PassiveRoleTranslationEnabled(),
+		isScopeLabeled(stream.Labels),
+		localRole,
+		r.JetStreamController.ColdStartRoleDefaultsPassive(),
+		stream.Spec.Mirror != nil,
+	) {
+		// ACTIVE-role translation: the gitops "mirror baseline" CR carries both a
+		// Mirror and the authored Subjects. Strip the Mirror so the effective spec
+		// is primary form; shouldConvertActiveRole then fires and the two-phase
+		// in-place promote converges the server mirror to a primary (messages
+		// preserved, never deleted). The in-cluster CR is left untouched.
+		translated := translateStreamSpecToPrimary(&stream.Spec)
+		effectiveSpec = &translated
+		log.Info("Active-role translation: stripping CR-authored mirror so the effective spec is primary form (keeping authored subjects).",
+			"localRole", localRole,
+			"namespace", stream.Namespace,
+			"streamName", stream.Spec.Name,
+		)
 	}
 
 	// CreateOrUpdateStream is called on every reconciliation when the stream is not to be deleted.
