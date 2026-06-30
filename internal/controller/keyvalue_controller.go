@@ -212,6 +212,26 @@ func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger
 			"namespace", keyValue.Namespace,
 			"bucket", keyValue.Spec.Bucket,
 		)
+	} else if shouldTranslateActiveRole(
+		r.JetStreamController.PassiveRoleTranslationEnabled(),
+		isScopeLabeled(keyValue.Labels),
+		localRole,
+		r.JetStreamController.ColdStartRoleDefaultsPassive(),
+		keyValue.Spec.Mirror != nil,
+	) {
+		// ACTIVE-role translation (the KeyValue companion to the stream fix, PR
+		// #17): the gitops "mirror baseline" KV CR carries BOTH a Mirror and the
+		// authored bucket config. Strip the Mirror so the effective spec is
+		// primary form; shouldConvertActiveRole then fires and the in-place
+		// UpdateKeyValue promote converges the server mirror to a primary (keys
+		// preserved, never deleted). The in-cluster CR is left untouched.
+		translated := translateKeyValueSpecToPrimary(&keyValue.Spec)
+		effectiveSpec = &translated
+		log.Info("Active-role translation: stripping CR-authored mirror so the effective spec is primary form (keeping authored bucket config).",
+			"localRole", localRole,
+			"namespace", keyValue.Namespace,
+			"bucket", keyValue.Spec.Bucket,
+		)
 	}
 
 	// Create or Update the KeyValue based on the spec

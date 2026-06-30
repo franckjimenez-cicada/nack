@@ -286,3 +286,36 @@ func translateKeyValueSpecToMirror(orig *api.KeyValueSpec, remoteDomain string) 
 	}
 	return translated
 }
+
+// translateKeyValueSpecToPrimary is the KeyValue analog of
+// translateStreamSpecToPrimary and the INVERSE of translateKeyValueSpecToMirror:
+// it returns a deep-copied KeyValue spec with Mirror + Sources cleared, leaving
+// the authored bucket config (Bucket, History, TTL, MaxBytes, Replicas,
+// Compression, RePublish, …) intact, so the effective spec is PRIMARY form.
+//
+// Why this is needed (the KeyValue companion to the stream active-role fix, PR
+// #17): the DRP gitops authors the secondary region's scope KV buckets in
+// "mirror baseline" form — the in-cluster CR carries BOTH a Mirror (used while
+// the region is passive) AND the authored bucket config (used once it is
+// promoted). passive-role translation handles the passive direction (clear
+// Sources, set Mirror). Its inverse was missing for KeyValue: when the region
+// flips ACTIVE, the CR's effective spec STILL carried the authored Mirror, so
+// shouldConvertActiveRole (which requires a primary-form effective spec) never
+// fired and the scope KV's backing stream stayed a server-side mirror with no
+// primary — exactly the prod failover gap on pre-approval-risk-bucket /
+// quotefeed-bucket. Stripping the Mirror here makes the effective spec
+// primary-form, so the in-place UpdateKeyValue promote converges the server
+// mirror to a primary WITHOUT deleting the KV_<bucket> backing stream (keys
+// preserved). The in-cluster CR is left untouched (server-side translation
+// only).
+//
+// translateKeyValueSpecToMirror SETS Mirror and clears Sources; this inverse
+// clears both Mirror and Sources, mirroring the Stream version's contract
+// exactly. Uses the generated DeepCopy so pointer fields stay independent and
+// the original spec / in-cluster CR is never mutated.
+func translateKeyValueSpecToPrimary(orig *api.KeyValueSpec) api.KeyValueSpec {
+	translated := *orig.DeepCopy()
+	translated.Mirror = nil
+	translated.Sources = nil
+	return translated
+}
