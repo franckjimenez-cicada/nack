@@ -186,6 +186,20 @@ func (r *StreamReconciler) deleteStream(ctx context.Context, log logr.Logger, st
 	return nil
 }
 
+// CreateOrUpdate is a thin exported delegation to createOrUpdate — the
+// reconcile-core step that evaluates passive/active local-role translation
+// (drp.cicada.io/local-role) and applies the resulting (possibly translated)
+// Stream spec to the NATS server. It exists SOLELY so the non-internal
+// pkg/roletranslate test-support package can drive this EXACT production
+// code path from outside the module (Go's internal/ import restriction
+// otherwise blocks external harnesses, e.g. drp-operator's integration
+// tests, from reaching it) without duplicating the translation logic.
+// Reconcile (the real controller-runtime entry point) calls createOrUpdate
+// directly and never goes through this method.
+func (r *StreamReconciler) CreateOrUpdate(ctx context.Context, log logr.Logger, stream *api.Stream) error {
+	return r.createOrUpdate(ctx, log, stream)
+}
+
 func (r *StreamReconciler) createOrUpdate(ctx context.Context, log logr.Logger, stream *api.Stream) error {
 	// gated tracks whether the BackupRequired condition was raised
 	// during this reconcile pass. The outer block uses it to decide
