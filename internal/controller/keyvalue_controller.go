@@ -187,6 +187,15 @@ func (r *KeyValueReconciler) deleteKeyValue(ctx context.Context, log logr.Logger
 	return nil
 }
 
+// CreateOrUpdate is the KeyValue analog of StreamReconciler.CreateOrUpdate: a
+// thin exported delegation to createOrUpdate so the non-internal
+// pkg/roletranslate test-support package can drive the real KeyValue
+// local-role translation + apply logic from outside the module. See
+// StreamReconciler.CreateOrUpdate for the full rationale.
+func (r *KeyValueReconciler) CreateOrUpdate(ctx context.Context, log logr.Logger, keyValue *api.KeyValue) error {
+	return r.createOrUpdate(ctx, log, keyValue)
+}
+
 func (r *KeyValueReconciler) createOrUpdate(ctx context.Context, log logr.Logger, keyValue *api.KeyValue) error {
 	// Evaluate passive-role translation BEFORE any NATS interaction so
 	// the rest of the reconcile (mirror-flip detection, backup gate,
